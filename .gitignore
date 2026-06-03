@@ -1,0 +1,17 @@
+# .NET Core
+bin/
+obj/
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# SuperDisplay reference folder
+superdisplay/
+SuperDisplay/
+
+# Log files
+*.log

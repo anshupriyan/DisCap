@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.22621.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- Project metadata -->
+    <RootNamespace>Discap.Host</RootNamespace>
+    <AssemblyName>Discap.Host</AssemblyName>
+    <Version>0.1.0</Version>
+    <Authors>Discap Contributors</Authors>
+    <Description>Open-source virtual display streamer for Windows to Android over USB</Description>
+    <RepositoryUrl>https://github.com/discap/discap</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DirectX / DXGI for Desktop Duplication -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.1" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.1" />
+
+    <!-- Media Foundation for hardware (NVENC) encoding -->
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.1" />
+
+    <!-- LZ4 block compression -->
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+
+    <!-- High-performance buffered I/O -->
+    <PackageReference Include="System.IO.Pipelines" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>
