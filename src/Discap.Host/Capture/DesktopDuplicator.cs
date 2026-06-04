@@ -1,9 +1,9 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Vortice;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
-using Vortice.Mathematics;
 
 namespace Discap.Host.Capture;
 
@@ -66,53 +66,69 @@ public sealed class DesktopDuplicator : IDisposable
 
             // Create DXGI factory and get the adapter.
             using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
-            using var adapter = factory.GetAdapter1(_adapterIndex);
+
+            factory.EnumAdapters1((uint)_adapterIndex, out var adapter);
+            if (adapter == null)
+            {
+                Console.Error.WriteLine("[CAP] Failed to get GPU adapter");
+                return false;
+            }
 
             Console.WriteLine($"[CAP] Using adapter: {adapter.Description.Description}");
 
-            // Create D3D11 device.
+            // Create D3D11 device on this adapter.
             D3D11.D3D11CreateDevice(
                 adapter,
                 DriverType.Unknown,
                 DeviceCreationFlags.BgraSupport,
                 new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 },
                 out _device,
-                out _context);
+                out _context).CheckError();
 
             if (_device == null || _context == null)
             {
                 Console.Error.WriteLine("[CAP] Failed to create D3D11 device");
+                adapter.Dispose();
                 return false;
             }
 
             // Find the target output.
             // If targetOutputIndex == -1, use the last output (the virtual display).
             int outputCount = 0;
-            using (var tempAdapter = factory.GetAdapter1(_adapterIndex))
+            while (true)
             {
-                while (tempAdapter.EnumOutputs(outputCount, out var tempOut).Success)
-                {
-                    tempOut.Dispose();
-                    outputCount++;
-                }
+                var hr = adapter.EnumOutputs((uint)outputCount, out var tempOut);
+                if (hr.Failure)
+                    break;
+                tempOut?.Dispose();
+                outputCount++;
             }
 
             if (outputCount == 0)
             {
                 Console.Error.WriteLine("[CAP] No display outputs found on this adapter");
+                adapter.Dispose();
                 return false;
             }
 
             _outputIndex = targetOutputIndex >= 0 ? targetOutputIndex : outputCount - 1;
             Console.WriteLine($"[CAP] Targeting output index {_outputIndex} (of {outputCount} total)");
 
-            // Get the output and duplicate it.
-            using var output = adapter.GetOutput(_outputIndex);
-            using var output1 = output.QueryInterface<IDXGIOutput1>();
+            // Get the target output and duplicate it.
+            adapter.EnumOutputs((uint)_outputIndex, out var output);
+            adapter.Dispose(); // Done with adapter.
 
+            if (output == null)
+            {
+                Console.Error.WriteLine("[CAP] Failed to get target output");
+                return false;
+            }
+
+            using var output1 = output.QueryInterface<IDXGIOutput1>();
             var outputDesc = output.Description;
             _width = outputDesc.DesktopCoordinates.Right - outputDesc.DesktopCoordinates.Left;
             _height = outputDesc.DesktopCoordinates.Bottom - outputDesc.DesktopCoordinates.Top;
+            output.Dispose();
 
             Console.WriteLine($"[CAP] Output resolution: {_width}x{_height}");
 
@@ -121,8 +137,8 @@ public sealed class DesktopDuplicator : IDisposable
             // Create staging texture for CPU readback.
             var stagingDesc = new Texture2DDescription
             {
-                Width = _width,
-                Height = _height,
+                Width = (uint)_width,
+                Height = (uint)_height,
                 MipLevels = 1,
                 ArraySize = 1,
                 Format = Format.B8G8R8A8_UNorm,
@@ -158,7 +174,7 @@ public sealed class DesktopDuplicator : IDisposable
         try
         {
             var result = _duplication.AcquireNextFrame(
-                _timeoutMs, out var frameInfo, out var desktopResource);
+                (uint)_timeoutMs, out var frameInfo, out var desktopResource);
 
             if (result.Failure)
             {
@@ -193,7 +209,7 @@ public sealed class DesktopDuplicator : IDisposable
                 var mapped = _context.Map(_stagingTexture, 0, MapMode.Read);
                 try
                 {
-                    var frame = new FrameBuffer(_width, _height, mapped.RowPitch);
+                    var frame = new FrameBuffer(_width, _height, (int)mapped.RowPitch);
                     frame.TimestampTicks = Stopwatch.GetTimestamp();
                     frame.DirtyRects = dirtyRects;
                     frame.TotalDirtyArea = totalDirtyArea;
@@ -243,32 +259,19 @@ public sealed class DesktopDuplicator : IDisposable
 
         try
         {
-            // Query the size needed for dirty rects.
-            int bufferSize = 1024; // Start with space for ~64 rects.
-            var buffer = new byte[bufferSize];
-
-            var result = _duplication.GetFrameDirtyRects(bufferSize, buffer, out int rectsSize);
-            if (result.Failure || rectsSize == 0)
+            var rects = new RawRect[64]; // Space for up to 64 dirty rects.
+            var hr = _duplication.GetFrameDirtyRects((uint)(rects.Length * Marshal.SizeOf<RawRect>()), rects, out uint rectsSize);
+            if (hr.Failure || rectsSize == 0)
                 return Array.Empty<RawRect>();
 
-            int rectCount = rectsSize / Marshal.SizeOf<RawRect>();
-            var rects = new RawRect[rectCount];
+            uint rectCount = rectsSize / (uint)Marshal.SizeOf<RawRect>();
+            if (rectCount == 0)
+                return Array.Empty<RawRect>();
 
-            var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-            try
-            {
-                var ptr = handle.AddrOfPinnedObject();
-                for (int i = 0; i < rectCount; i++)
-                {
-                    rects[i] = Marshal.PtrToStructure<RawRect>(ptr + i * Marshal.SizeOf<RawRect>());
-                }
-            }
-            finally
-            {
-                handle.Free();
-            }
-
-            return rects;
+            // Return only the filled portion.
+            var result = new RawRect[rectCount];
+            Array.Copy(rects, result, (int)rectCount);
+            return result;
         }
         catch
         {

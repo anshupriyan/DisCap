@@ -1,5 +1,5 @@
 using System.Buffers;
-using Vortice.Mathematics;
+using Vortice;
 
 namespace Discap.Host.Capture;
 

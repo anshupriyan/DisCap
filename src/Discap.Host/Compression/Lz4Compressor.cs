@@ -44,7 +44,7 @@ public sealed class Lz4Compressor
         int compressedSize = LZ4Codec.Encode(
             pixels, 0, length,
             _outputBuffer, 0, _outputBuffer.Length,
-            LZ4Level.L00);
+            LZ4Level.L00_FAST);
 
         if (compressedSize <= 0)
         {
@@ -69,7 +69,7 @@ public sealed class Lz4Compressor
         int compressedSize = LZ4Codec.Encode(
             pixels,
             _outputBuffer.AsSpan(),
-            LZ4Level.L00);
+            LZ4Level.L00_FAST);
 
         if (compressedSize <= 0)
         {
