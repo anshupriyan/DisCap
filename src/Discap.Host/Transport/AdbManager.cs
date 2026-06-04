@@ -9,9 +9,9 @@ namespace Discap.Host.Transport;
 /// tcp:{port} on the Android device. The Android app listens on that port,
 /// and the Windows host connects to it through localhost.
 ///
-/// ADB forward direction: PC → Android
-///   adb forward tcp:53516 tcp:53516
-///   PC app connects to localhost:53516 → reaches Android app on port 53516
+/// ADB reverse direction: Android -> PC
+///   adb reverse tcp:53516 tcp:53516
+///   Android app connects to localhost:53516 -> reaches PC app on port 53516
 /// </summary>
 public sealed class AdbManager : IDisposable
 {
@@ -111,44 +111,44 @@ public sealed class AdbManager : IDisposable
     }
 
     /// <summary>
-    /// Sets up ADB port forwarding: localhost:{port} → Android device tcp:{port}.
+    /// Sets up ADB port reverse: Android tcp:{port} -> localhost:{port} on the PC.
     /// </summary>
     public bool SetupForward(int port)
     {
         if (_adbPath == null)
         {
-            Console.Error.WriteLine("[ADB] Cannot setup forward — ADB not found");
+            Console.Error.WriteLine("[ADB] Cannot setup reverse — ADB not found");
             return false;
         }
 
         try
         {
-            // Remove any existing forward on this port first.
-            RunAdbCommand(_adbPath, $"forward --remove tcp:{port}", waitMs: 3000);
+            // Remove any existing reverse on this port first.
+            RunAdbCommand(_adbPath, $"reverse --remove tcp:{port}", waitMs: 3000);
 
-            // Set up the forward.
-            var result = RunAdbCommand(_adbPath, $"forward tcp:{port} tcp:{port}", waitMs: 5000);
+            // Set up the reverse port mapping.
+            var result = RunAdbCommand(_adbPath, $"reverse tcp:{port} tcp:{port}", waitMs: 5000);
             if (result.ExitCode == 0)
             {
                 _forwardedPort = port;
-                Console.WriteLine($"[ADB] Port forward active: localhost:{port} → device tcp:{port}");
+                Console.WriteLine($"[ADB] Port reverse active: device tcp:{port} -> localhost:{port}");
                 return true;
             }
             else
             {
-                Console.Error.WriteLine($"[ADB] Forward failed: {result.Error}");
+                Console.Error.WriteLine($"[ADB] Reverse failed: {result.Error}");
                 return false;
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ADB] Forward error: {ex.Message}");
+            Console.Error.WriteLine($"[ADB] Reverse error: {ex.Message}");
             return false;
         }
     }
 
     /// <summary>
-    /// Removes the ADB port forwarding.
+    /// Removes the ADB port reverse mapping.
     /// </summary>
     public void RemoveForward(int port)
     {
@@ -156,13 +156,13 @@ public sealed class AdbManager : IDisposable
 
         try
         {
-            RunAdbCommand(_adbPath, $"forward --remove tcp:{port}", waitMs: 3000);
-            Console.WriteLine($"[ADB] Port forward removed: tcp:{port}");
+            RunAdbCommand(_adbPath, $"reverse --remove tcp:{port}", waitMs: 3000);
+            Console.WriteLine($"[ADB] Port reverse removed: tcp:{port}");
             _forwardedPort = 0;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ADB] Failed to remove forward: {ex.Message}");
+            Console.Error.WriteLine($"[ADB] Failed to remove reverse: {ex.Message}");
         }
     }
 
