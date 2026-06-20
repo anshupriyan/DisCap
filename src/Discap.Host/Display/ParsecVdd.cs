@@ -30,9 +30,9 @@ public static class ParsecVdd
     // These are computed from the device type, function codes, and access flags.
     // FILE_DEVICE_BUS_EXTENDER = 0x2A, METHOD_BUFFERED = 0, FILE_ANY_ACCESS = 0
 
-    private const uint IOCTL_ADD = 0x2A0000 | (0x900 << 2);     // Function 0x900
-    private const uint IOCTL_REMOVE = 0x2A0000 | (0x901 << 2);  // Function 0x901
-    private const uint IOCTL_UPDATE = 0x2A0000 | (0x902 << 2);  // Function 0x902
+    private const uint IOCTL_ADD = 0x0022e004;
+    private const uint IOCTL_REMOVE = 0x0022a008;
+    private const uint IOCTL_UPDATE = 0x0022a00c;
 
     // ─── Device status ──────────────────────────────────────────────────
 
@@ -273,16 +273,20 @@ public static class ParsecVdd
                 out _, IntPtr.Zero))
                 return null;
 
-            // Open the device handle for IOCTL communication.
+            const uint GENERIC_READ = 0x80000000;
             const uint GENERIC_WRITE = 0x40000000;
             const uint OPEN_EXISTING = 3;
+            const uint FILE_ATTRIBUTE_NORMAL = 0x80;
+            const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
+            const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
+
             var handle = CreateFile(
                 detailData.DevicePath,
-                GENERIC_WRITE,
-                0, // No sharing
+                GENERIC_READ | GENERIC_WRITE,
+                3, // FILE_SHARE_READ | FILE_SHARE_WRITE
                 IntPtr.Zero,
                 OPEN_EXISTING,
-                0,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
                 IntPtr.Zero);
 
             return handle.IsInvalid ? null : handle;
@@ -298,12 +302,16 @@ public static class ParsecVdd
     /// </summary>
     public static int AddDisplay(SafeFileHandle deviceHandle)
     {
+        var inBuffer = new byte[32];
         var outBuffer = new byte[4];
-        if (DeviceIoControl(deviceHandle, IOCTL_ADD, null, 0,
+        if (DeviceIoControl(deviceHandle, IOCTL_ADD, inBuffer, 32,
             outBuffer, 4, out _, IntPtr.Zero))
         {
+            Update(deviceHandle);
             return BitConverter.ToInt32(outBuffer, 0);
         }
+        int error = Marshal.GetLastWin32Error();
+        Console.WriteLine($"[VDD] DeviceIoControl(IOCTL_ADD) failed with error: {error}");
         return -1;
     }
 
@@ -312,9 +320,15 @@ public static class ParsecVdd
     /// </summary>
     public static bool RemoveDisplay(SafeFileHandle deviceHandle, int displayIndex)
     {
-        var inBuffer = BitConverter.GetBytes(displayIndex);
-        return DeviceIoControl(deviceHandle, IOCTL_REMOVE,
-            inBuffer, 4, null, 0, out _, IntPtr.Zero);
+        var inBuffer = new byte[32];
+        // 16-bit big-endian index
+        inBuffer[0] = (byte)((displayIndex >> 8) & 0xFF);
+        inBuffer[1] = (byte)(displayIndex & 0xFF);
+
+        bool success = DeviceIoControl(deviceHandle, IOCTL_REMOVE,
+            inBuffer, 32, null, 0, out _, IntPtr.Zero);
+        if (success) Update(deviceHandle);
+        return success;
     }
 
     /// <summary>
@@ -323,8 +337,9 @@ public static class ParsecVdd
     /// </summary>
     public static bool Update(SafeFileHandle deviceHandle)
     {
+        var inBuffer = new byte[32];
         return DeviceIoControl(deviceHandle, IOCTL_UPDATE,
-            null, 0, null, 0, out _, IntPtr.Zero);
+            inBuffer, 32, null, 0, out _, IntPtr.Zero);
     }
 
     /// <summary>

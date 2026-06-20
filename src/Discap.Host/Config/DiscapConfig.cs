@@ -35,13 +35,19 @@ public sealed class DiscapConfig
     /// Below this threshold, LZ4 is used for lossless compression.
     /// Default 0.15 (15% of screen area).
     /// </summary>
-    public float MotionThreshold { get; set; } = 0.15f;
+    public float MotionThreshold { get; set; } = 0.0001f;
 
     /// <summary>
     /// Timeout in milliseconds for Desktop Duplication AcquireNextFrame.
     /// Lower values = more responsive but higher CPU usage when idle.
     /// </summary>
     public int CaptureTimeoutMs { get; set; } = 100;
+
+    /// <summary>
+    /// Target video bitrate in bits per second.
+    /// Default is 20,000,000 (20 Mbps) for smooth high-motion streaming.
+    /// </summary>
+    public int Bitrate { get; set; } = 20_000_000;
 
     /// <summary>
     /// Path to adb.exe. If null, searches PATH and common locations.
@@ -89,6 +95,9 @@ public sealed class DiscapConfig
                 case "--adb" when i + 1 < args.Length:
                     config.AdbPath = args[++i];
                     break;
+                case "--bitrate" when i + 1 < args.Length:
+                    config.Bitrate = int.Parse(args[++i]) * 1_000_000; // Parse as Mbps
+                    break;
                 case "--adapter" when i + 1 < args.Length:
                     config.AdapterIndex = int.Parse(args[++i]);
                     break;
@@ -119,7 +128,8 @@ public sealed class DiscapConfig
               --height <pixels>     Virtual display height (default: 1200)
               --fps <rate>          Refresh rate in Hz (default: 60)
               --port <port>         ADB forward port (default: 53516)
-              --threshold <0.0-1.0> Motion threshold for NVENC switch (default: 0.15)
+              --threshold <0.0-1.0> Motion threshold for NVENC switch (default: 0.0001)
+              --bitrate <Mbps>      Target video bitrate in Mbps (default: 20)
               --adb <path>          Path to adb.exe (default: auto-detect)
               --adapter <index>     GPU adapter index (default: 0)
               --lz4-only            Force LZ4-only mode, disable hardware encoding

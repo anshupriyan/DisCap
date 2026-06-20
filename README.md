@@ -23,8 +23,8 @@ Windows Host                           Android Tablet
 │ Desktop Duplication │               │   ↓              │
 │   ↓                 │    USB/ADB    │ Decompress       │
 │ Frame Analysis      │──────────────→│   ↓              │
-│   ↓         ↓       │  tcp:53516   │ Render           │
-│  LZ4    NVENC H.264 │               │ (SurfaceView)   │
+│   ↓         ↓       │  tcp:53516    │ Render           │
+│  LZ4    NVENC H.264 │               │ (SurfaceView)    │
 │   ↓         ↓       │               │                  │
 │ Packet Protocol     │               │ Touch/Stylus     │
 │ (32-byte DCAP hdr)  │←──────────────│ Input Events     │

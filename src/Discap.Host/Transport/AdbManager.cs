@@ -34,11 +34,19 @@ public sealed class AdbManager : IDisposable
     public bool FindAdb(string? explicitPath = null)
     {
         // 1. Explicit path from config.
-        if (!string.IsNullOrEmpty(explicitPath) && File.Exists(explicitPath))
+        if (!string.IsNullOrEmpty(explicitPath))
         {
-            _adbPath = explicitPath;
-            Console.WriteLine($"[ADB] Using explicit path: {_adbPath}");
-            return true;
+            explicitPath = Environment.ExpandEnvironmentVariables(explicitPath.Trim('"', '\''));
+            if (File.Exists(explicitPath))
+            {
+                _adbPath = explicitPath;
+                Console.WriteLine($"[ADB] Using explicit path: {_adbPath}");
+                return true;
+            }
+            else
+            {
+                Console.WriteLine($"[ADB] Explicit path not found: {explicitPath}");
+            }
         }
 
         // 2. Check PATH via `where adb`.

@@ -11,7 +11,7 @@ public sealed class VirtualDisplayManager : IDisposable
 {
     private SafeFileHandle? _deviceHandle;
     private int _displayIndex = -1;
-    private Timer? _pingTimer;
+    private System.Threading.Timer? _pingTimer;
     private volatile bool _disposed;
 
     /// <summary>True if a virtual display is currently active.</summary>
@@ -64,7 +64,7 @@ public sealed class VirtualDisplayManager : IDisposable
         // Start the keep-alive ping timer.
         // The driver disconnects all displays if not pinged for ~1 second.
         // We ping every 100ms to stay well within the deadline.
-        _pingTimer = new Timer(PingCallback, null, TimeSpan.Zero, TimeSpan.FromMilliseconds(100));
+        _pingTimer = new System.Threading.Timer(PingCallback, null, TimeSpan.Zero, TimeSpan.FromMilliseconds(100));
         Console.WriteLine("[VDD] Keep-alive ping timer started (100ms interval)");
 
         return true;

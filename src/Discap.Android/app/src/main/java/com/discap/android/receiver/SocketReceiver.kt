@@ -9,14 +9,27 @@ import java.io.EOFException
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.max
 
-class SocketReceiver(private val surface: Surface) {
+class SocketReceiver(
+    private val surface: Surface,
+    private val statsCallback: ((FrameStats) -> Unit)? = null
+) {
 
     private var isRunning = false
     private var thread: Thread? = null
 
     private var h264Decoder: H264Decoder? = null
     private var lz4Decoder: Lz4Decoder? = null
+
+    val sender = SocketSender()
+
+    data class FrameStats(
+        val fps: Double,
+        val bitrateMbps: Double,
+        val latencyMs: Double,
+        val encoderType: String
+    )
 
     // 32-byte header structure
     // 0..3   Magic "DCAP"
@@ -58,9 +71,14 @@ class SocketReceiver(private val surface: Surface) {
                 socket = Socket("127.0.0.1", 53516)
                 socket.tcpNoDelay = true
                 socket.receiveBufferSize = 2 * 1024 * 1024
+                sender.attachSocket(socket)
                 Log.i("Discap.Net", "Connected to host.")
 
                 val input = DataInputStream(socket.getInputStream())
+                var statsFrames = 0
+                var statsBytes = 0L
+                var statsStartNs = System.nanoTime()
+                var streamBaseUs: Long? = null
 
                 while (isRunning) {
                     // Read exactly 32 bytes of header
@@ -68,8 +86,8 @@ class SocketReceiver(private val surface: Surface) {
 
                     val bb = ByteBuffer.wrap(headerBuffer).order(ByteOrder.LITTLE_ENDIAN)
                     val magic = bb.getInt()
-                    if (magic != 0x50414344) { // "DCAP" in little-endian (0x44 0x43 0x41 0x50)
-                        Log.e("Discap.Net", "Invalid magic header! Disconnecting.")
+                    if (magic != 0x44434150) { // "DCAP" = 0x44434150
+                        Log.e("Discap.Net", "Invalid magic header! Expected 0x44434150, got 0x${Integer.toHexString(magic)}. Disconnecting.")
                         break
                     }
 
@@ -79,7 +97,9 @@ class SocketReceiver(private val surface: Surface) {
                     val height = bb.getShort().toInt()
                     val originalSize = bb.getInt()
                     val compressedSize = bb.getInt()
-                    // Ignoring the rest for decoding
+                    val timestampUs = bb.getLong()
+                    bb.getInt() // sequence number
+                    bb.getShort() // flags
 
                     // Resize payload buffer if needed
                     if (compressedSize > payloadBuffer.size) {
@@ -88,6 +108,8 @@ class SocketReceiver(private val surface: Surface) {
 
                     // Read exactly compressedSize bytes of payload
                     input.readFully(payloadBuffer, 0, compressedSize)
+                    
+                    Log.i("Discap.Net", "[RCV] Packet received: type=$frameType size=$compressedSize")
 
                     // Route to appropriate decoder
                     if (frameType.toInt() == 2) {
@@ -105,6 +127,27 @@ class SocketReceiver(private val surface: Surface) {
                         }
                         lz4Decoder?.decode(payloadBuffer, compressedSize, originalSize)
                     }
+
+                    statsFrames++
+                    statsBytes += 32L + compressedSize
+                    val nowNs = System.nanoTime()
+                    val nowUs = nowNs / 1000
+                    if (streamBaseUs == null) {
+                        streamBaseUs = nowUs - timestampUs
+                    }
+
+                    val statsElapsedNs = nowNs - statsStartNs
+                    if (statsElapsedNs >= 250_000_000L) {
+                        val elapsedSec = statsElapsedNs / 1_000_000_000.0
+                        val fps = statsFrames / elapsedSec
+                        val bitrate = statsBytes * 8.0 / elapsedSec / 1_000_000.0
+                        val latency = max(0.0, (nowUs - streamBaseUs!! - timestampUs) / 1000.0)
+                        val encoder = if (frameType.toInt() == 2) "H.264" else "LZ4"
+                        statsCallback?.invoke(FrameStats(fps, bitrate, latency, encoder))
+                        statsFrames = 0
+                        statsBytes = 0
+                        statsStartNs = nowNs
+                    }
                 }
 
             } catch (e: EOFException) {
@@ -115,6 +158,7 @@ class SocketReceiver(private val surface: Surface) {
                     Thread.sleep(1000) // Wait before reconnecting
                 }
             } finally {
+                sender.detachSocket()
                 try { socket?.close() } catch (e: Exception) {}
             }
         }

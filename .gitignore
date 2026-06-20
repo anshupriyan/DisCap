@@ -15,3 +15,29 @@ SuperDisplay/
 
 # Log files
 *.log
+
+# Android IDE and build files
+.gradle/
+.idea/
+build/
+app/build/
+local.properties
+
+# Root scratch/test files
+/CheckD3D11Video.cs
+/CheckMFNet.cs
+/CheckReflection.cs
+/NvEncoder.h
+/ReflectTest/
+/TestH264.cs
+/dotnet
+/func_list.txt
+/init.txt
+/init_params.txt
+/nvEncodeAPI.h
+/parsec-vdd.h
+/temp.txt
+/test_mf.cs
+
+# Large binary files
+ffmpeg.exe

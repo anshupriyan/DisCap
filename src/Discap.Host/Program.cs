@@ -5,6 +5,9 @@ using Discap.Host.Config;
 using Discap.Host.Display;
 using Discap.Host.Protocol;
 using Discap.Host.Transport;
+using Discap.Host.Input;
+using System.Net.Sockets;
+using Discap.Host.Network;
 
 namespace Discap.Host;
 
@@ -56,15 +59,35 @@ public static class Program
             Console.WriteLine("\n[SYS] Shutdown requested (Ctrl+C)...");
         };
 
+        // Setup a background timer to keep the cursor visible when idle
+        using var cursorKeepAliveTimer = new System.Threading.Timer(_ =>
+        {
+            try
+            {
+                var pos = System.Windows.Forms.Cursor.Position;
+                System.Windows.Forms.Cursor.Position = new System.Drawing.Point(pos.X + 1, pos.Y);
+                System.Windows.Forms.Cursor.Position = pos;
+            }
+            catch { }
+        }, null, 5000, 5000);
+
+
         using var vddManager = new VirtualDisplayManager();
         using var duplicator = new DesktopDuplicator(config.AdapterIndex, config.CaptureTimeoutMs);
-        using var encoder = new HardwareEncoder();
+        IVideoEncoder encoder = new HardwareEncoder();
         using var adbManager = new AdbManager();
         using var server = new StreamServer(config.Port);
+        using var usbTransport = new UsbTransport();
 
         var lz4 = new Lz4Compressor();
         var analyzer = new FrameAnalyzer(config.MotionThreshold);
         var packetWriter = new PacketWriter();
+        var streamSettings = new StreamSettings(
+            config.Bitrate / 1_000_000,
+            config.RefreshRate,
+            100,
+            ControlPacket.EncoderAuto,
+            false);
 
         // ─── Step 1: Check and start Parsec VDD ───────────────────────
         Console.WriteLine("═══ Step 1: Virtual Display ═══");
@@ -108,8 +131,23 @@ public static class Program
         bool nvencAvailable = false;
         if (!config.ForceLz4Only)
         {
-            nvencAvailable = encoder.Initialize(
-                duplicator.Width, duplicator.Height, config.RefreshRate);
+            nvencAvailable = encoder.Initialize(duplicator.Width, duplicator.Height, config.RefreshRate, config.Bitrate);
+            if (nvencAvailable && encoder is HardwareEncoder hw)
+            {
+                nvencAvailable = hw.OpenDevice(duplicator.Device!.NativePointer);
+            }
+            
+            if (nvencAvailable)
+            {
+                Console.WriteLine("[ENC] Direct NVENC hardware encoder active");
+            }
+            else
+            {
+                Console.WriteLine("[ENC] HardwareEncoder initialization failed, falling back to ffmpeg.");
+                encoder.Dispose();
+                encoder = new FfmpegEncoder();
+                nvencAvailable = encoder.Initialize(duplicator.Width, duplicator.Height, config.RefreshRate, config.Bitrate);
+            }
         }
         else
         {
@@ -119,62 +157,84 @@ public static class Program
         Console.WriteLine("[LZ4] LZ4 compressor ready");
         Console.WriteLine();
 
-        // ─── Step 4: Setup ADB ────────────────────────────────────────
-        Console.WriteLine("═══ Step 4: ADB Transport ═══");
+        // ─── Step 4 & 5: Transport and Streaming ──────────────────────
+        Console.WriteLine("═══ Step 4: Transport ═══");
 
-        if (!adbManager.FindAdb(config.AdbPath))
+        Stream? clientStream = null;
+        
+        // Attempt AOA USB Bulk Transport First
+        bool usbActive = usbTransport.TryConnect(3000); // 3 seconds timeout
+        if (usbActive)
         {
-            Console.Error.WriteLine("[ADB] Cannot proceed without ADB.");
-            return 1;
+            Console.WriteLine("[USB] AOA bulk transfer active");
+            clientStream = usbTransport.Stream;
         }
-
-        if (!adbManager.IsDeviceConnected())
+        else
         {
-            Console.Error.WriteLine("[ADB] No Android device detected!");
-            Console.Error.WriteLine("[ADB] Connect your tablet via USB and enable USB debugging.");
-            Console.Error.WriteLine("[ADB] Waiting for device...");
-
-            // Poll for device connection.
-            while (_running && !adbManager.IsDeviceConnected())
+            Console.WriteLine("[USB] AOA failed, falling back to ADB");
+            
+            if (!adbManager.FindAdb(config.AdbPath))
             {
-                await Task.Delay(2000);
+                Console.Error.WriteLine("[ADB] Cannot proceed without ADB.");
+                return 1;
             }
 
-            if (!_running) return 0;
+            if (!adbManager.IsDeviceConnected())
+            {
+                Console.Error.WriteLine("[ADB] No Android device detected!");
+                Console.Error.WriteLine("[ADB] Connect your tablet via USB and enable USB debugging.");
+                Console.Error.WriteLine("[ADB] Waiting for device...");
+
+                while (_running && !adbManager.IsDeviceConnected())
+                {
+                    await Task.Delay(2000);
+                }
+
+                if (!_running) return 0;
+            }
+
+            var serial = adbManager.GetDeviceSerial();
+            Console.WriteLine($"[ADB] Device connected: {serial}");
+
+            if (!adbManager.SetupForward(config.Port))
+            {
+                Console.Error.WriteLine("[ADB] Failed to setup port forwarding.");
+                return 1;
+            }
+            
+            Console.WriteLine("═══ Step 5: Streaming ═══");
+            server.Start();
         }
 
-        var serial = adbManager.GetDeviceSerial();
-        Console.WriteLine($"[ADB] Device connected: {serial}");
-
-        if (!adbManager.SetupForward(config.Port))
-        {
-            Console.Error.WriteLine("[ADB] Failed to setup port forwarding.");
-            return 1;
-        }
-        Console.WriteLine();
-
-        // ─── Step 5: Start streaming server ───────────────────────────
-        Console.WriteLine("═══ Step 5: Streaming ═══");
-        server.Start();
-
-        // Main loop: accept clients and stream frames.
         var cts = new CancellationTokenSource();
         uint sequenceNumber = 0;
         var streamStartTime = Stopwatch.GetTimestamp();
 
         while (_running)
         {
-            // Wait for a client to connect.
-            if (!await server.WaitForClientAsync(cts.Token))
+            if (!usbActive)
             {
-                if (!_running) break;
-                await Task.Delay(1000);
-                continue;
+                // Wait for ADB client to connect
+                if (!await server.WaitForClientAsync(cts.Token))
+                {
+                    if (!_running) break;
+                    await Task.Delay(1000);
+                    continue;
+                }
+                clientStream = server.ClientStream;
+            }
+            else
+            {
+                // If using USB and it disconnected, break inner loop to try reconnecting
+                if (clientStream == null) break;
             }
 
             Console.WriteLine("[STREAM] Starting capture loop...");
             Console.WriteLine("[STREAM] Press Ctrl+C to stop.");
             Console.WriteLine();
+
+            // Spawn background task to read input events from the client
+            var inputTask = Task.Run(() => HandleInput(clientStream!, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height, streamSettings));
 
             // Reset counters for this session.
             sequenceNumber = 0;
@@ -184,75 +244,185 @@ public static class Program
             int lz4Frames = 0;
             int nvencFrames = 0;
             long totalBytesSent = 0;
+            long lastSentTicks = 0;
+            encoder.ForceKeyFrame();
+
+            int droppedFrames = 0;
+            long totalEncodeTicks = 0;
+            long totalSendTicks = 0;
+            long loopIteration = 0;
+            FrameBuffer? lastFrame = null; // used to resend when screen is static
 
             // ─── Capture loop ─────────────────────────────────────────
-            while (_running && server.IsClientConnected)
+            bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
+            while (_running && isClientConnected())
             {
-                // Capture next frame.
-                using var frame = duplicator.AcquireNextFrame();
-                if (frame == null)
+                Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
+                if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
+
+                int fpsCap = streamSettings.FpsCap;
+                if (fpsCap > 0 && lastSentTicks != 0)
                 {
-                    // No new frame — screen hasn't changed, or timeout.
+                    long minFrameTicks = Stopwatch.Frequency / fpsCap;
+                    long elapsedSinceSend = Stopwatch.GetTimestamp() - lastSentTicks;
+                    long remainingTicks = minFrameTicks - elapsedSinceSend;
+                    if (remainingTicks > 0)
+                    {
+                        int delayMs = Math.Max(1, (int)(remainingTicks * 1000 / Stopwatch.Frequency));
+                        await Task.Delay(delayMs);
+                    }
+                }
+
+                // Capture next frame.
+                // On timeout (static screen) DXGI returns null — reuse last frame so the
+                // encoder pipeline keeps ticking rather than stalling indefinitely.
+                Console.WriteLine($"[LOOP] {loopIteration}: waiting for AcquireNextFrame...");
+                var newFrame = duplicator.AcquireNextFrame();
+                Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}" );
+                FrameBuffer? frame;
+                bool isRepeatFrame;
+                if (newFrame != null)
+                {
+                    lastFrame?.Dispose();
+                    lastFrame = newFrame;
+                    frame = newFrame;
+                    isRepeatFrame = false;
+                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured, dirtyArea={frame.TotalDirtyArea}");
+                }
+                else if (lastFrame != null && nvencAvailable && !config.ForceLz4Only)
+                {
+                    // Screen is static — feed last frame to NVENC so it emits inter frames.
+                    frame = lastFrame;
+                    isRepeatFrame = true;
+                    Console.WriteLine($"[LOOP] {loopIteration}: timeout — resending last frame to keep encoder alive");
+                }
+                else
+                {
+                    Console.WriteLine($"[LOOP] {loopIteration}: timeout, no previous frame — skipping");
                     continue;
                 }
 
+                // For NVENC, always encode regardless of dirty-area — DXGI dirty rects are
+                // unreliable and were silently killing the stream after the first IDR.
+                // For LZ4-only mode, skip unchanged frames to save bandwidth.
+                if (!isRepeatFrame && frame.TotalDirtyArea == 0 && (config.ForceLz4Only || !nvencAvailable))
+                {
+                    Console.WriteLine($"[LOOP] {loopIteration}: zero dirty area (LZ4 mode) — skipping");
+                    continue;
+                }
+                
                 // Determine encoding type based on motion analysis.
                 var frameType = FrameType.LZ4; // Default
                 byte[] compressedData;
                 int compressedSize;
+                float dirtyRatio = analyzer.ComputeDirtyRatio(frame);
+                int encoderMode = streamSettings.EncoderMode;
 
-                if (nvencAvailable && !config.ForceLz4Only)
+                long encodeStartTicks = Stopwatch.GetTimestamp();
+
+                // ALWAYS use NVENC when available. The old analyzer-based routing
+                // was the root cause: DXGI dirty rects are often tiny even during
+                // full-screen video, so motionThreshold was never met and every
+                // frame went to LZ4 (6.78MB each!). H.264 produces ~100KB frames.
+                if (nvencAvailable && !config.ForceLz4Only && encoderMode != ControlPacket.EncoderLz4)
                 {
-                    frameType = analyzer.Analyze(frame);
+                    frameType = FrameType.NVENC;
                 }
 
                 // Compress or encode the frame.
                 if (frameType == FrameType.NVENC && nvencAvailable)
                 {
-                    compressedSize = encoder.Encode(frame, out compressedData);
-                    if (compressedSize <= 0)
+                    encoder.SetTargetBitrate(GetTargetBitrate(streamSettings.BitrateMbps, dirtyRatio, config.MotionThreshold));
+                    Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
+                    encoder.SubmitFrame(frame);
+                    Console.WriteLine($"[ENC] {loopIteration}: SubmitFrame returned");
+
+                    bool sentAny = false;
+                    
+                    // Wait up to 100ms for at least one NAL unit to arrive, then drain the queue of all immediately available NAL units.
+                    while (encoder.TryGetNextPacket(out compressedData, out compressedSize, sentAny ? 0 : 100))
                     {
-                        // NVENC failed — fall back to LZ4 for this frame.
-                        frameType = FrameType.LZ4;
-                        var tightPixels = frame.GetTightPixels();
-                        compressedSize = lz4.Compress(tightPixels, out compressedData);
+                        sentAny = true;
+                        
+                        long elapsedTicks = frame.TimestampTicks - streamStartTime;
+                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                        int originalSize = frame.Width * frame.Height * 4;
+                        ushort flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
+
+                        var header = PacketHeader.Create(
+                            frameType,
+                            (ushort)frame.Width,
+                            (ushort)frame.Height,
+                            (uint)originalSize,
+                            (uint)compressedSize,
+                            elapsedUs,
+                            sequenceNumber++,
+                            flags);
+
+                        long sendStartTicks = Stopwatch.GetTimestamp();
+                        try
+                        {
+                            Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
+                            packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
+                            long tSendEnd = Stopwatch.GetTimestamp();
+                            
+                            double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
+                            double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
+                            
+                            Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Encode: {encodeMs:F2}ms | Send: {sendMs:F2}ms");
+
+                            totalBytesSent += PacketHeader.SIZE + compressedSize;
+                            lastSentTicks = Stopwatch.GetTimestamp();
+                            totalSendTicks += (lastSentTicks - sendStartTicks);
+                        }
+                        catch (Exception)
+                        {
+                            Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
+                            break;
+                        }
                     }
-                    else
-                    {
-                        nvencFrames++;
-                    }
+
+                    if (!sentAny) droppedFrames++;
+                    else nvencFrames++;
+                    
+                    long encodeTicks = Stopwatch.GetTimestamp() - encodeStartTicks;
+                    totalEncodeTicks += encodeTicks;
+                    
+                    fpsCounter++;
+                    continue; // Skip the LZ4 packet sending logic below
                 }
-                else
-                {
-                    frameType = FrameType.LZ4;
-                    var tightPixels = frame.GetTightPixels();
-                    compressedSize = lz4.Compress(tightPixels, out compressedData);
-                    lz4Frames++;
-                }
+                
+                // Fallback to LZ4
+                frameType = FrameType.LZ4;
+                var tightPixels = frame.GetTightPixels();
+                compressedSize = lz4.Compress(tightPixels, out compressedData);
+                lz4Frames++;
 
-                // Calculate timestamp.
-                long elapsedTicks = frame.TimestampTicks - streamStartTime;
-                long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                long lz4EncodeTicks = Stopwatch.GetTimestamp() - encodeStartTicks;
+                totalEncodeTicks += lz4EncodeTicks;
 
-                // Build packet header.
-                int originalSize = frame.Width * frame.Height * 4; // BGRA = 4 bytes/pixel
-                ushort flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
+                long lz4ElapsedTicks = frame.TimestampTicks - streamStartTime;
+                long lz4ElapsedUs = lz4ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                int lz4OriginalSize = frame.Width * frame.Height * 4;
+                ushort lz4Flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
 
-                var header = PacketHeader.Create(
+                var lz4Header = PacketHeader.Create(
                     frameType,
                     (ushort)frame.Width,
                     (ushort)frame.Height,
-                    (uint)originalSize,
+                    (uint)lz4OriginalSize,
                     (uint)compressedSize,
-                    elapsedUs,
+                    lz4ElapsedUs,
                     sequenceNumber++,
-                    flags);
+                    lz4Flags);
 
-                // Send packet to client.
+                long lz4SendStartTicks = Stopwatch.GetTimestamp();
                 try
                 {
-                    packetWriter.WritePacket(server.ClientStream!, header, compressedData, 0, compressedSize);
+                    packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
                     totalBytesSent += PacketHeader.SIZE + compressedSize;
+                    lastSentTicks = Stopwatch.GetTimestamp();
+                    totalSendTicks += (lastSentTicks - lz4SendStartTicks);
                 }
                 catch (Exception)
                 {
@@ -268,20 +438,27 @@ public static class Program
                 {
                     double fps = fpsCounter * (double)Stopwatch.Frequency / elapsed;
                     double mbps = totalBytesSent * 8.0 / 1_000_000;
-                    float ratio = originalSize > 0 ? (float)compressedSize / originalSize : 0;
-                    float dirtyRatio = analyzer.ComputeDirtyRatio(frame);
+                    double avgFrameKb = totalBytesSent / 1024.0 / Math.Max(1, fpsCounter);
+                    double avgEncodeMs = totalEncodeTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, fpsCounter);
+                    double avgSendMs = totalSendTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, fpsCounter);
+                    string encName = nvencFrames > lz4Frames ? "NVENC" : "LZ4";
 
-                    Console.Write($"\r[STREAM] {fps:F1} fps | {mbps:F1} Mbps total | " +
-                                  $"LZ4:{lz4Frames} NVENC:{nvencFrames} | " +
-                                  $"ratio:{ratio:P0} | dirty:{dirtyRatio:P0}   ");
+                    // The exact STATS format requested
+                    Console.WriteLine($"[STATS] FPS: {fps:F0} | Encoder: {encName} | Avg frame: {avgFrameKb:F0}KB | Encode time: {avgEncodeMs:F1}ms | Send time: {avgSendMs:F1}ms | Dropped: {droppedFrames} | Net: {mbps:F1} Mbps");
 
                     fpsCounter = 0;
                     lastFpsTime = now;
                     lz4Frames = 0;
                     nvencFrames = 0;
                     totalBytesSent = 0;
+                    droppedFrames = 0;
+                    totalEncodeTicks = 0;
+                    totalSendTicks = 0;
                 }
             }
+
+            lastFrame?.Dispose();
+            lastFrame = null;
 
             Console.WriteLine();
             Console.WriteLine("[STREAM] Session ended.");
@@ -294,10 +471,96 @@ public static class Program
         }
 
         // ─── Clean shutdown ───────────────────────────────────────────
+        encoder.Dispose();
         Console.WriteLine();
         Console.WriteLine("═══ Shutting down ═══");
         cts.Cancel();
 
         return 0;
+    }
+
+    private static int GetTargetBitrate(int requestedMbps, float dirtyRatio, float motionThreshold)
+    {
+        int requested = Math.Clamp(requestedMbps, 5, 50) * 1_000_000;
+        return dirtyRatio >= motionThreshold ? requested : Math.Min(requested, 8_000_000);
+    }
+
+    private static void HandleInput(Stream stream, int boundsX, int boundsY, int width, int height, StreamSettings settings)
+    {
+        byte[] buffer = new byte[InputPacket.SIZE];
+        try
+        {
+            while (true)
+            {
+                stream.ReadExactly(buffer, 0, InputPacket.SIZE);
+                if (InputPacket.TryReadFrom(buffer, out var packet))
+                {
+                    MouseInjector.ProcessInput(packet, boundsX, boundsY, width, height);
+                }
+                else if (ControlPacket.TryReadFrom(buffer, out var control))
+                {
+                    settings.Update(control);
+                    Console.WriteLine($"\n[CFG] Client settings: {settings.BitrateMbps}Mbps, {settings.FpsCap}fps, {settings.ResolutionScale}%, mode={settings.EncoderMode}, stats={settings.ShowStats}");
+                }
+            }
+        }
+        catch
+        {
+            // Client disconnected or stream closed
+        }
+    }
+
+    private sealed class StreamSettings
+    {
+        private volatile int _bitrateMbps;
+        private volatile int _fpsCap;
+        private volatile int _resolutionScale;
+        private volatile int _encoderMode;
+        private volatile bool _showStats;
+
+        public StreamSettings(int bitrateMbps, int fpsCap, int resolutionScale, int encoderMode, bool showStats)
+        {
+            _bitrateMbps = Math.Clamp(bitrateMbps, 5, 50);
+            _fpsCap = NormalizeFps(fpsCap);
+            _resolutionScale = NormalizeScale(resolutionScale);
+            _encoderMode = NormalizeEncoderMode(encoderMode);
+            _showStats = showStats;
+        }
+
+        public int BitrateMbps => _bitrateMbps;
+        public int FpsCap => _fpsCap;
+        public int ResolutionScale => _resolutionScale;
+        public int EncoderMode => _encoderMode;
+        public bool ShowStats => _showStats;
+
+        public void Update(ControlPacket packet)
+        {
+            _bitrateMbps = Math.Clamp(packet.BitrateMbps, (byte)5, (byte)50);
+            _fpsCap = NormalizeFps(packet.FpsCap);
+            _resolutionScale = NormalizeScale(packet.ResolutionScale);
+            _encoderMode = NormalizeEncoderMode(packet.EncoderMode);
+            _showStats = packet.ShowStats != 0;
+        }
+
+        private static int NormalizeFps(int fps) => fps switch
+        {
+            30 => 30,
+            120 => 120,
+            _ => 60
+        };
+
+        private static int NormalizeScale(int scale) => scale switch
+        {
+            50 => 50,
+            75 => 75,
+            _ => 100
+        };
+
+        private static int NormalizeEncoderMode(int mode) => mode switch
+        {
+            ControlPacket.EncoderH264 => ControlPacket.EncoderH264,
+            ControlPacket.EncoderLz4 => ControlPacket.EncoderLz4,
+            _ => ControlPacket.EncoderAuto
+        };
     }
 }

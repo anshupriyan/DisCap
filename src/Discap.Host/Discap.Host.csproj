@@ -9,6 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
 
     <!-- Project metadata -->
@@ -23,17 +24,25 @@
 
   <ItemGroup>
     <!-- DirectX / DXGI for Desktop Duplication -->
+    <PackageReference Include="LibUsbDotNet" Version="2.2.29" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.1" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.1" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.1" />
 
     <!-- Media Foundation for hardware (NVENC) encoding -->
-    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.1" />
+    <PackageReference Include="MediaFoundation.Net" Version="2.0.0.32" />
 
     <!-- LZ4 block compression -->
     <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
 
     <!-- High-performance buffered I/O -->
     <PackageReference Include="System.IO.Pipelines" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="ffmpeg.exe">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>
