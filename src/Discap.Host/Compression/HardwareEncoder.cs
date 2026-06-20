@@ -8,13 +8,30 @@ namespace Discap.Host.Compression;
 
 public sealed class HardwareEncoder : IVideoEncoder
 {
+    // ── Win32 P/Invoke for async event handling ──────────────────────
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateEventW(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, IntPtr lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    private const uint WAIT_OBJECT_0 = 0x00000000;
+    private const uint WAIT_TIMEOUT = 0x00000102;
+
     private bool _available;
     public bool IsAvailable => _available;
 
     private NvEncoder _encoder;
     private NvEncRegisteredPtr _registeredTexture;
     private NvEncOutputPtr _bitstreamBuffer;
-    
+
+    /// <summary>Win32 auto-reset event handle signaled by NVENC when a frame finishes encoding.</summary>
+    private IntPtr _completionEvent;
+
     private int _width;
     private int _height;
     private int _bitrate;
@@ -88,7 +105,7 @@ public sealed class HardwareEncoder : IVideoEncoder
             DarHeight = (uint)_height,
             FrameRateNum = (uint)_frameRate,
             FrameRateDen = 1,
-            EnableEncodeAsync = 0,
+            EnableEncodeAsync = 1,   // ← Async mode: NVENC signals event on completion
             EnablePTD = 1,
             ReportSliceOffsets = false,
             MaxEncodeWidth = (uint)_width,
@@ -121,18 +138,41 @@ public sealed class HardwareEncoder : IVideoEncoder
         }
         _bitstreamBuffer = bitstreamParams.BitstreamBuffer;
 
-        Console.WriteLine("[ENC] NVENC Session configured for D3D11 NV12 streaming.");
+        // ── Async mode: create Win32 event and register with NVENC ──
+        _completionEvent = CreateEventW(IntPtr.Zero, false, false, IntPtr.Zero);
+        if (_completionEvent == IntPtr.Zero)
+        {
+            Console.Error.WriteLine($"[ENC] CreateEventW failed: Win32 error {Marshal.GetLastWin32Error()}");
+            return false;
+        }
+
+        var eventParams = new NvEncEventParams
+        {
+            Version = LibNvEnc.NV_ENC_EVENT_PARAMS_VER,
+            CompletionEvent = _completionEvent
+        };
+        status = LibNvEnc.FunctionList.RegisterAsyncEvent(_encoder, ref eventParams);
+        if (status != NvEncStatus.Success)
+        {
+            Console.Error.WriteLine($"[ENC] RegisterAsyncEvent failed: {status} (0x{(int)status:X8})");
+            CloseHandle(_completionEvent);
+            _completionEvent = IntPtr.Zero;
+            return false;
+        }
+
+        Console.WriteLine("[ENC] NVENC Session configured for D3D11 NV12 streaming (async mode).");
         return true;
     }
 
     private IntPtr _lastTexturePointer;
 
     /// <summary>
-    /// True between a successful EncodePicture call and the moment all output packets
-    /// have been drained by TryGetNextPacket. Guards LockBitstream so it is never
-    /// called on a buffer that has no pending output — which would block indefinitely.
+    /// True after a successful EncodePicture call until the completion event
+    /// has been waited on and the bitstream fully drained. Guards
+    /// WaitForSingleObject + LockBitstream so they are never called when
+    /// NVENC has no pending output — preventing indefinite hangs.
     /// </summary>
-    private bool _hasPendingOutput;
+    private bool _frameSubmitted;
 
     public unsafe void SubmitFrame(FrameBuffer frame)
     {
@@ -181,7 +221,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         };
         if (LibNvEnc.FunctionList.MapInputResource(_encoder, ref mapParams) != NvEncStatus.Success) return;
 
-        // Encode picture
+        // Encode picture — async mode: set CompletionEvent so NVENC signals
+        // when this frame's output is ready. EncodePicture returns immediately.
         var picParams = new NvEncPicParams
         {
             Version = LibNvEnc.NV_ENC_PIC_PARAMS_VER,
@@ -191,16 +232,19 @@ public sealed class HardwareEncoder : IVideoEncoder
             InputBuffer = mapParams.MappedResource,
             OutputBitstream = _bitstreamBuffer,
             BufferFmt = mapParams.MappedBufferFmt,
-            PictureStruct = NvEncPicStruct.Frame
+            PictureStruct = NvEncPicStruct.Frame,
+            CompletionEvent = _completionEvent
         };
 
-        Console.WriteLine($"[ENC] {DiagIteration}: calling NvEncEncodePicture...");
+        Console.WriteLine($"[ENC] {DiagIteration}: calling NvEncEncodePicture (async)...");
         var encStatus = LibNvEnc.FunctionList.EncodePicture(_encoder, ref picParams);
         Console.WriteLine($"[ENC] {DiagIteration}: NvEncEncodePicture returned {encStatus}");
 
-        // Signal that there is real output waiting to be read.
+        // In async mode, Success means the frame is queued and the event will
+        // be signaled when output is ready. Mark it so TryGetNextPacket knows
+        // there is work to wait for.
         if (encStatus == NvEncStatus.Success)
-            _hasPendingOutput = true;
+            _frameSubmitted = true;
 
         // Unmap resource
         LibNvEnc.FunctionList.UnmapInputResource(_encoder, mapParams.MappedResource);
@@ -215,10 +259,11 @@ public sealed class HardwareEncoder : IVideoEncoder
         if (!_available) return false;
 
         // Nothing was submitted since the last full drain — bail out immediately.
-        // This is the critical guard: without it, LockBitstream blocks forever
-        // on a buffer that has no pending output.
-        if (!_hasPendingOutput && _naluQueue.Count == 0) return false;
+        // This is the critical guard that prevents the hang bug: never wait on
+        // the event or call LockBitstream when there is no pending output.
+        if (!_frameSubmitted && _naluQueue.Count == 0) return false;
 
+        // Drain any previously extracted NALUs first.
         if (_naluQueue.Count > 0)
         {
             var data = _naluQueue.Dequeue();
@@ -235,12 +280,30 @@ public sealed class HardwareEncoder : IVideoEncoder
                 
             Console.WriteLine($"[ENC] NAL type={nalType} size={naluSize} bytes");
             // If queue is now empty, the pending output has been fully drained.
-            if (_naluQueue.Count == 0) _hasPendingOutput = false;
+            if (_naluQueue.Count == 0) _frameSubmitted = false;
             return true;
         }
 
         if (_bitstreamBuffer.Handle == IntPtr.Zero) return false;
 
+        // ── Async mode: wait for the completion event with a bounded timeout ──
+        // This replaces the synchronous assumption. NVENC signals the event
+        // when the encode finishes. We use a bounded timeout so we never
+        // hang indefinitely even if NVENC fails to signal for any reason.
+        uint waitResult = WaitForSingleObject(_completionEvent, (uint)Math.Max(0, timeoutMs));
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            // Encode not finished yet — return false, caller can retry.
+            return false;
+        }
+        if (waitResult != WAIT_OBJECT_0)
+        {
+            Console.Error.WriteLine($"[ENC] WaitForSingleObject failed: result=0x{waitResult:X8}, error={Marshal.GetLastWin32Error()}");
+            _frameSubmitted = false;
+            return false;
+        }
+
+        // Event signaled — output is ready. Lock the bitstream to retrieve it.
         var lockParams = new NvEncLockBitstream
         {
             Version = LibNvEnc.NV_ENC_LOCK_BITSTREAM_VER,
@@ -248,7 +311,11 @@ public sealed class HardwareEncoder : IVideoEncoder
         };
 
         var status = LibNvEnc.FunctionList.LockBitstream(_encoder, ref lockParams);
-        if (status != NvEncStatus.Success) return false;
+        if (status != NvEncStatus.Success)
+        {
+            _frameSubmitted = false;
+            return false;
+        }
 
         int totalSize = (int)lockParams.BitstreamSizeInBytes;
         
@@ -277,12 +344,12 @@ public sealed class HardwareEncoder : IVideoEncoder
                 
             Console.WriteLine($"[ENC] NAL type={nalType} size={naluSize} bytes");
             // If queue is now empty, the pending output has been fully drained.
-            if (_naluQueue.Count == 0) _hasPendingOutput = false;
+            if (_naluQueue.Count == 0) _frameSubmitted = false;
             return true;
         }
 
         // LockBitstream returned no data — treat as fully drained.
-        _hasPendingOutput = false;
+        _frameSubmitted = false;
         return false;
     }
 
@@ -335,6 +402,19 @@ public sealed class HardwareEncoder : IVideoEncoder
         _available = false;
         if (_encoder.Handle != IntPtr.Zero)
         {
+            // Unregister the async completion event before destroying the encoder.
+            if (_completionEvent != IntPtr.Zero)
+            {
+                var eventParams = new NvEncEventParams
+                {
+                    Version = LibNvEnc.NV_ENC_EVENT_PARAMS_VER,
+                    CompletionEvent = _completionEvent
+                };
+                LibNvEnc.FunctionList.UnregisterAsyncEvent(_encoder, ref eventParams);
+                CloseHandle(_completionEvent);
+                _completionEvent = IntPtr.Zero;
+            }
+
             if (_bitstreamBuffer.Handle != IntPtr.Zero)
                 LibNvEnc.FunctionList.DestroyBitstreamBuffer(_encoder, _bitstreamBuffer);
             if (_registeredTexture.Handle != IntPtr.Zero)

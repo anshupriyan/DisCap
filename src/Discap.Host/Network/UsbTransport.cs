@@ -18,6 +18,9 @@ public sealed class UsbTransport : IDisposable
     private const int AccessoryPid1 = 0x2D00;
     private const int AccessoryPid2 = 0x2D01;
 
+    /// <summary>Hard cap on total AOA attempt time so fallback to ADB isn't delayed too long.</summary>
+    private const int MaxAoaAttemptMs = 10_000;
+
     public bool IsConnected => _connected && _usbDevice != null && _usbDevice.IsOpen;
 
     private readonly Stream _memoryStream;
@@ -30,66 +33,137 @@ public sealed class UsbTransport : IDisposable
 
     public bool TryConnect(int timeoutMs)
     {
-        Console.WriteLine("[USB] Attempting AOA negotiation...");
+        // Cap the timeout so AOA never delays startup too long.
+        timeoutMs = Math.Min(timeoutMs, MaxAoaAttemptMs);
+        Console.WriteLine($"[USB] Attempting AOA negotiation (timeout={timeoutMs}ms, max={MaxAoaAttemptMs}ms)...");
         long start = Environment.TickCount64;
 
         // Step 1: Find if a device is ALREADY in accessory mode
+        Console.WriteLine("[USB] Step 1: Checking for existing accessory device...");
         var accessoryDevice = FindAccessoryDevice();
+        if (accessoryDevice != null)
+        {
+            Console.WriteLine($"[USB] Found device already in accessory mode: VID=0x{accessoryDevice.Vid:X4} PID=0x{accessoryDevice.Pid:X4}");
+        }
+
         if (accessoryDevice == null)
         {
             // Step 2: Try to find ANY Android device and put it into accessory mode
+            Console.WriteLine("[USB] Step 2: Scanning for Android devices to switch to accessory mode...");
             var allDevices = UsbDevice.AllDevices;
+            Console.WriteLine($"[USB] Found {allDevices.Count} USB device(s) total");
+            bool sentAoaStart = false;
+
             foreach (UsbRegistry registry in allDevices)
             {
-                if (registry.Vid == GoogleVendorId && (registry.Pid == AccessoryPid1 || registry.Pid == AccessoryPid2)) continue;
+                Console.WriteLine($"[USB]   Device: VID=0x{registry.Vid:X4} PID=0x{registry.Pid:X4}");
 
+                if (registry.Vid == GoogleVendorId && (registry.Pid == AccessoryPid1 || registry.Pid == AccessoryPid2))
+                {
+                    Console.WriteLine("[USB]   Skipping — already an accessory PID");
+                    continue;
+                }
+
+                Console.WriteLine("[USB]   Attempting to open device...");
                 if (registry.Open(out UsbDevice tempDevice))
                 {
+                    Console.WriteLine("[USB]   Device opened successfully");
                     try
                     {
                         if (TryStartAccessoryMode(tempDevice))
                         {
                             Console.WriteLine("[USB] Sent AOA start command. Waiting for reconnection...");
+                            sentAoaStart = true;
                             break; // Wait for it to reconnect
                         }
+                        else
+                        {
+                            Console.WriteLine("[USB]   TryStartAccessoryMode returned false");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[USB]   TryStartAccessoryMode threw exception: {ex.GetType().Name}: {ex.Message}");
                     }
                     finally
                     {
                         if (tempDevice.IsOpen) tempDevice.Close();
                     }
                 }
+                else
+                {
+                    Console.Error.WriteLine("[USB]   Failed to open device (permissions? driver?)");
+                }
             }
 
-            // Step 3: Wait for the device to reappear as an accessory
+            if (!sentAoaStart)
+            {
+                Console.Error.WriteLine("[USB] No device accepted AOA handshake — giving up");
+                return false;
+            }
+
+            // Step 3: Wait for the device to reappear as an accessory.
+            // The Android device disconnects from USB and reconnects as a new
+            // device in accessory mode — this takes at least a few seconds.
+            Console.WriteLine("[USB] Step 3: Waiting 3s for device to re-enumerate in accessory mode...");
+            Thread.Sleep(3000); // Initial delay — device needs time to reboot into accessory mode
+
+            Console.WriteLine("[USB] Polling for accessory device (500ms interval)...");
             while (Environment.TickCount64 - start < timeoutMs)
             {
                 accessoryDevice = FindAccessoryDevice();
-                if (accessoryDevice != null) break;
-                Thread.Sleep(100);
+                if (accessoryDevice != null)
+                {
+                    Console.WriteLine($"[USB] Accessory device appeared: VID=0x{accessoryDevice.Vid:X4} PID=0x{accessoryDevice.Pid:X4}");
+                    break;
+                }
+                Thread.Sleep(500);
             }
-        }
 
-        if (accessoryDevice == null)
-        {
-            return false;
+            if (accessoryDevice == null)
+            {
+                long elapsedMs = Environment.TickCount64 - start;
+                Console.Error.WriteLine($"[USB] Accessory device did not appear after {elapsedMs}ms — timeout");
+                return false;
+            }
         }
 
         // Step 4: Open the accessory device and endpoints
+        Console.WriteLine("[USB] Step 4: Opening accessory device and claiming interface...");
         if (accessoryDevice.Open(out _usbDevice))
         {
+            Console.WriteLine("[USB] Accessory device opened successfully");
+
             IUsbDevice wholeUsbDevice = _usbDevice as IUsbDevice;
             if (!ReferenceEquals(wholeUsbDevice, null))
             {
-                wholeUsbDevice.SetConfiguration(1);
-                wholeUsbDevice.ClaimInterface(0);
+                Console.WriteLine("[USB] Setting configuration 1...");
+                bool configOk = wholeUsbDevice.SetConfiguration(1);
+                Console.WriteLine($"[USB] SetConfiguration(1): {(configOk ? "OK" : "FAILED")}");
+
+                Console.WriteLine("[USB] Claiming interface 0...");
+                bool claimOk = wholeUsbDevice.ClaimInterface(0);
+                Console.WriteLine($"[USB] ClaimInterface(0): {(claimOk ? "OK" : "FAILED")}");
+
+                if (!configOk || !claimOk)
+                {
+                    Console.Error.WriteLine("[USB] Failed to configure accessory device — may need WinUSB driver (install via Zadig)");
+                }
             }
 
+            Console.WriteLine("[USB] Opening endpoints (OUT=Ep01, IN=Ep01)...");
             _writer = _usbDevice.OpenEndpointWriter(WriteEndpointID.Ep01); // Standard AOA OUT
             _reader = _usbDevice.OpenEndpointReader(ReadEndpointID.Ep01);  // Standard AOA IN
+            Console.WriteLine($"[USB] Writer endpoint: {(_writer != null ? "OK" : "NULL")}");
+            Console.WriteLine($"[USB] Reader endpoint: {(_reader != null ? "OK" : "NULL")}");
+
             _connected = true;
+            long totalMs = Environment.TickCount64 - start;
+            Console.WriteLine($"[USB] AOA connection established in {totalMs}ms");
             return true;
         }
 
+        Console.Error.WriteLine("[USB] Failed to open accessory device");
         return false;
     }
 
@@ -107,43 +181,86 @@ public sealed class UsbTransport : IDisposable
 
     private bool TryStartAccessoryMode(UsbDevice device)
     {
-        // 51: Get Protocol
+        // 51: Get Protocol — check if the device supports AOA
+        Console.WriteLine("[USB]   Sending AOA GetProtocol (request=51)...");
         UsbSetupPacket getProtocol = new UsbSetupPacket(
             (byte)(UsbCtrlFlags.Direction_In | UsbCtrlFlags.RequestType_Vendor | UsbCtrlFlags.Recipient_Device),
             51, 0, 0, 2);
             
         byte[] protocolBuffer = new byte[2];
         int transferred;
-        if (!device.ControlTransfer(ref getProtocol, protocolBuffer, 2, out transferred) || transferred != 2)
+        bool result = device.ControlTransfer(ref getProtocol, protocolBuffer, 2, out transferred);
+        Console.WriteLine($"[USB]   GetProtocol result={result}, transferred={transferred} bytes");
+
+        if (!result || transferred != 2)
+        {
+            Console.Error.WriteLine($"[USB]   GetProtocol failed — device may not support AOA (result={result}, transferred={transferred})");
             return false;
+        }
 
         ushort protocol = BitConverter.ToUInt16(protocolBuffer, 0);
-        if (protocol < 1) return false;
+        Console.WriteLine($"[USB]   AOA protocol version: {protocol}");
+        if (protocol < 1)
+        {
+            Console.Error.WriteLine("[USB]   Protocol version < 1 — device does not support AOA");
+            return false;
+        }
 
-        // 52: Send Strings
-        SendString(device, 0, "Discap"); // Manufacturer
-        SendString(device, 1, "DiscapDisplay"); // Model
-        SendString(device, 2, "Virtual Display Streamer"); // Description
-        SendString(device, 3, "1.0"); // Version
-        SendString(device, 4, "https://github.com/discap"); // URI
-        SendString(device, 5, "0000000012345678"); // Serial
+        // 52: Send Strings — these must match the Android app's accessory_filter.xml
+        Console.WriteLine("[USB]   Sending AOA identification strings (request=52)...");
+        bool stringsOk = true;
+        stringsOk &= SendAoaString(device, 0, "Discap");                     // Manufacturer
+        stringsOk &= SendAoaString(device, 1, "DiscapDisplay");              // Model
+        stringsOk &= SendAoaString(device, 2, "Virtual Display Streamer");   // Description
+        stringsOk &= SendAoaString(device, 3, "1.0");                        // Version
+        stringsOk &= SendAoaString(device, 4, "https://github.com/discap");  // URI
+        stringsOk &= SendAoaString(device, 5, "0000000012345678");           // Serial
 
-        // 53: Start Accessory
+        if (!stringsOk)
+        {
+            Console.Error.WriteLine("[USB]   One or more AOA strings failed to send");
+            return false;
+        }
+        Console.WriteLine("[USB]   All AOA strings sent successfully");
+
+        // 53: Start Accessory — tells the device to reboot into accessory mode
+        Console.WriteLine("[USB]   Sending AOA Start (request=53)...");
         UsbSetupPacket startRequest = new UsbSetupPacket(
             (byte)(UsbCtrlFlags.Direction_Out | UsbCtrlFlags.RequestType_Vendor | UsbCtrlFlags.Recipient_Device),
             53, 0, 0, 0);
             
-        return device.ControlTransfer(ref startRequest, null, 0, out transferred);
+        result = device.ControlTransfer(ref startRequest, null, 0, out transferred);
+        Console.WriteLine($"[USB]   AOA Start result={result}, transferred={transferred}");
+
+        if (!result)
+        {
+            Console.Error.WriteLine("[USB]   AOA Start command failed");
+            return false;
+        }
+
+        return true;
     }
 
-    private void SendString(UsbDevice device, short index, string str)
+    /// <summary>
+    /// Sends a single AOA identification string to the device.
+    /// Returns true on success, false on failure.
+    /// </summary>
+    private bool SendAoaString(UsbDevice device, short index, string str)
     {
         byte[] data = Encoding.UTF8.GetBytes(str + "\0");
         UsbSetupPacket request = new UsbSetupPacket(
             (byte)(UsbCtrlFlags.Direction_Out | UsbCtrlFlags.RequestType_Vendor | UsbCtrlFlags.Recipient_Device),
             52, 0, index, (short)data.Length);
-            
-        device.ControlTransfer(ref request, data, data.Length, out int _);
+
+        bool result = device.ControlTransfer(ref request, data, data.Length, out int transferred);
+        string status = result && transferred == data.Length ? "OK" : "FAILED";
+        Console.WriteLine($"[USB]     String[{index}] \"{str}\": {status} (sent={transferred}/{data.Length})");
+
+        if (!result)
+        {
+            Console.Error.WriteLine($"[USB]     ControlTransfer failed for string index {index}");
+        }
+        return result;
     }
 
     public void Write(byte[] buffer, int offset, int count)
@@ -213,3 +330,4 @@ public sealed class UsbTransport : IDisposable
         }
     }
 }
+
