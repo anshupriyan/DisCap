@@ -217,23 +217,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
             val accessory = intent?.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
             if (accessory != null) {
-                val usbManager = getSystemService(USB_SERVICE) as UsbManager
-                try {
-                    val pfd = usbManager.openAccessory(accessory)
-                    if (pfd != null) {
-                        Log.i("Discap", "Starting UsbReceiver for AOA")
-                        isUsbMode = true
-                        
-                        val decoder = H264Decoder(holder.surface, width, height)
-                        decoder.start()
-                        
-                        usbReceiver = UsbReceiver(pfd)
-                        usbReceiver?.setDecoder(decoder)
-                        usbReceiver?.start()
-                    }
-                } catch (e: Exception) {
-                    Log.e("Discap", "Failed to open USB accessory", e)
-                }
+                startUsbMode(accessory)
             }
         }
 
@@ -270,6 +254,43 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    override fun onNewIntent(newIntent: Intent?) {
+        super.onNewIntent(newIntent)
+        setIntent(newIntent)
+        if (newIntent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
+            val accessory = newIntent.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
+            if (accessory != null && surfaceView.holder.surface != null && surfaceView.holder.surface.isValid) {
+                startUsbMode(accessory)
+            }
+        }
+    }
+
+    private fun startUsbMode(accessory: UsbAccessory) {
+        val usbManager = getSystemService(USB_SERVICE) as UsbManager
+        try {
+            val pfd = usbManager.openAccessory(accessory)
+            if (pfd != null) {
+                Log.i("Discap", "Starting UsbReceiver for AOA")
+                isUsbMode = true
+                
+                socketReceiver?.stopReceiver()
+                socketReceiver = null
+
+                usbReceiver?.stop()
+                usbReceiver = UsbReceiver(pfd, surfaceView.holder.surface) { stats ->
+                    runOnUiThread {
+                        statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
+                                "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType} (USB)"
+                        statsView.visibility = if (showStats) View.VISIBLE else View.GONE
+                    }
+                }
+                usbReceiver?.start()
+            }
+        } catch (e: Exception) {
+            Log.e("Discap", "Failed to open USB accessory", e)
+        }
+    }
 
     companion object {
         private const val ENCODER_AUTO = 0

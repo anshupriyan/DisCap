@@ -312,8 +312,8 @@ public class WinUsbDevice : IDisposable
                     else
                     {
                         writePipe = pipeInfo.PipeId;
-                        writeMaxPacketSize = pipeInfo.MaximumPacketSize;
-                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2} (MaxPacketSize: {pipeInfo.MaximumPacketSize})");
+                        writeMaxPacketSize = 512; // HARDCODED for testing
+                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2} (MaxPacketSize: 512 (Hardcoded) from {pipeInfo.MaximumPacketSize})");
 
                         // Apply Optimizations to OUT pipe
                         byte rawIo = 1;
