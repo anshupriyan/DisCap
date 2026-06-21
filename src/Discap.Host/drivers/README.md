@@ -4,21 +4,24 @@ This directory contains the WinUSB driver installer used for AOAP (Android Open 
 
 ## Required File
 
-### `wdi-simple.exe`
+### `Zadig.exe`
 
-Download from the official **libwdi** releases:
-<https://github.com/pbatard/libwdi/releases>
+Download from the official Zadig website:
+<https://zadig.akeo.ie/downloads/>
 
-1. Download the latest `wdi-simple.exe` (~200KB) from the release assets
-2. Place it in this directory (`drivers/wdi-simple.exe`)
-3. The file must be named exactly `wdi-simple.exe`
+1. Download the latest `zadig-X.X.exe` (e.g., `zadig-2.9.exe`, ~5MB)
+2. **Rename it** to `Zadig.exe` and place it in this directory (`drivers/Zadig.exe`)
+3. The file must be named exactly `Zadig.exe`
 
 ## What It Does
 
-When you run Discap with `--transport aoap`, the driver manager uses `wdi-simple.exe` to:
+When you run Discap with `--transport aoap`, the driver manager:
 
-1. Install the WinUSB driver for your phone's VID/PID (replacing the ADB driver)
-2. Install the WinUSB driver for Google's AOA PIDs (0x18D1/0x2D00 and 0x18D1/0x2D01)
+1. Generates a `zadig.ini` config file that pre-fills the correct settings
+2. Launches Zadig with UAC elevation — a window will open
+3. You select your Android device and click **"Install Driver"**
+4. Zadig installs the WinUSB driver and closes automatically on success
+5. This is done once per device — subsequent runs skip the driver install
 
 This allows LibUsbDotNet to enumerate your phone and send the AOA control transfers
 needed to switch it into accessory mode.
@@ -28,8 +31,9 @@ needed to switch it into accessory mode.
 Installing WinUSB for your phone replaces the ADB driver. While in AOAP mode:
 - ADB commands will NOT work
 - File transfer (MTP) will NOT work
-- To revert: run `Discap.Host --revert-driver` for instructions
+- To revert: run `Discap.Host --revert-driver` for step-by-step instructions
 
 ## License
 
-libwdi / wdi-simple is licensed under LGPL v3. See <https://github.com/pbatard/libwdi/blob/master/LICENSE>.
+Zadig is licensed under GPL v3. See <https://github.com/pbatard/libwdi/blob/master/LICENSE>.
+It is a standalone tool and is not linked into the Discap binary.
