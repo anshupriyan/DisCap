@@ -165,15 +165,33 @@ public sealed class UsbTransport : IDisposable
     private WinUsbDevice? FindAccessoryDevice()
     {
         var devices = WinUsbDevice.EnumerateDevices(WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE);
+        WinUsbDevice? bestMatch = null;
+
         foreach (var device in devices)
         {
             if (device.Vid == GoogleVendorId && (device.Pid == AccessoryPid1 || device.Pid == AccessoryPid2))
             {
-                return device;
+                Console.WriteLine($"[USB]   Found AOA candidate: VID=0x{device.Vid:X4} PID=0x{device.Pid:X4} MI={(device.Mi.HasValue ? device.Mi.Value.ToString("X2") : "none")} Path={device.DevicePath}");
+                
+                if (device.Mi == 0)
+                {
+                    bestMatch = device;
+                }
+                else if (!device.Mi.HasValue && bestMatch == null)
+                {
+                    bestMatch = device;
+                }
             }
-            device.Dispose(); // Dispose others
         }
-        return null;
+
+        foreach (var device in devices)
+        {
+            if (device != bestMatch)
+            {
+                device.Dispose();
+            }
+        }
+        return bestMatch;
     }
 
     private bool TryStartAccessoryMode(WinUsbDevice device)

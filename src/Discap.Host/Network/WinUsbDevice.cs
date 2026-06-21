@@ -114,15 +114,17 @@ public class WinUsbDevice : IDisposable
     public string DevicePath { get; }
     public int Vid { get; }
     public int Pid { get; }
+    public int? Mi { get; }
     
     private SafeFileHandle? _fileHandle;
     private IntPtr _winUsbHandle = IntPtr.Zero;
 
-    private WinUsbDevice(string devicePath, int vid, int pid)
+    private WinUsbDevice(string devicePath, int vid, int pid, int? mi)
     {
         DevicePath = devicePath;
         Vid = vid;
         Pid = pid;
+        Mi = mi;
     }
 
     public static List<WinUsbDevice> EnumerateDevices(Guid interfaceGuid)
@@ -159,13 +161,18 @@ public class WinUsbDevice : IDisposable
                         IntPtr stringPtr = new IntPtr(detailData.ToInt64() + 4);
                         string path = Marshal.PtrToStringAuto(stringPtr) ?? string.Empty;
 
-                        // Parse VID and PID from the path (e.g. \\?\usb#vid_17ef&pid_201c#...)
-                        var match = Regex.Match(path, @"vid_([0-9a-f]{4})&pid_([0-9a-f]{4})", RegexOptions.IgnoreCase);
+                        // Parse VID, PID and optionally MI from the path
+                        var match = Regex.Match(path, @"vid_([0-9a-f]{4})&pid_([0-9a-f]{4})(?:&mi_([0-9a-f]{2}))?", RegexOptions.IgnoreCase);
                         if (match.Success)
                         {
                             int vid = Convert.ToInt32(match.Groups[1].Value, 16);
                             int pid = Convert.ToInt32(match.Groups[2].Value, 16);
-                            devices.Add(new WinUsbDevice(path, vid, pid));
+                            int? mi = null;
+                            if (match.Groups[3].Success)
+                            {
+                                mi = Convert.ToInt32(match.Groups[3].Value, 16);
+                            }
+                            devices.Add(new WinUsbDevice(path, vid, pid, mi));
                         }
                     }
                 }
