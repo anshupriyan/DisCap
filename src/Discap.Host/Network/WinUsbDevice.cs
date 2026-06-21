@@ -34,6 +34,62 @@ public class WinUsbDevice : IDisposable
     [DllImport("winusb.dll", SetLastError = true)]
     private static extern bool WinUsb_Free(IntPtr InterfaceHandle);
 
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_ControlTransfer(IntPtr InterfaceHandle, WINUSB_SETUP_PACKET SetupPacket, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
+
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_QueryInterfaceSettings(IntPtr InterfaceHandle, byte AlternateInterfaceNumber, out USB_INTERFACE_DESCRIPTOR UsbAltInterfaceDescriptor);
+
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_QueryPipe(IntPtr InterfaceHandle, byte AlternateInterfaceNumber, byte PipeIndex, out WINUSB_PIPE_INFORMATION PipeInformation);
+
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_ReadPipe(IntPtr InterfaceHandle, byte PipeID, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
+
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_WritePipe(IntPtr InterfaceHandle, byte PipeID, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct WINUSB_SETUP_PACKET
+    {
+        public byte RequestType;
+        public byte Request;
+        public ushort Value;
+        public ushort Index;
+        public ushort Length;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct USB_INTERFACE_DESCRIPTOR
+    {
+        public byte bLength;
+        public byte bDescriptorType;
+        public byte bInterfaceNumber;
+        public byte bAlternateSetting;
+        public byte bNumEndpoints;
+        public byte bInterfaceClass;
+        public byte bInterfaceSubClass;
+        public byte bInterfaceProtocol;
+        public byte iInterface;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct WINUSB_PIPE_INFORMATION
+    {
+        public byte PipeType;
+        public byte PipeId;
+        public ushort MaximumPacketSize;
+        public byte Interval;
+    }
+
+    public enum USBD_PIPE_TYPE : byte
+    {
+        UsbdPipeTypeControl,
+        UsbdPipeTypeIsochronous,
+        UsbdPipeTypeBulk,
+        UsbdPipeTypeInterrupt
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct SP_DEVICE_INTERFACE_DATA
     {
@@ -146,6 +202,83 @@ public class WinUsbDevice : IDisposable
         }
 
         return true;
+    }
+
+    public bool ControlTransfer(WINUSB_SETUP_PACKET setupPacket, byte[]? buffer, out uint lengthTransferred)
+    {
+        lengthTransferred = 0;
+        if (_winUsbHandle == IntPtr.Zero) return false;
+
+        uint bufferLength = buffer != null ? (uint)buffer.Length : 0;
+        return WinUsb_ControlTransfer(_winUsbHandle, setupPacket, buffer ?? Array.Empty<byte>(), bufferLength, out lengthTransferred, IntPtr.Zero);
+    }
+
+    public bool DiscoverPipes(out byte readPipe, out byte writePipe)
+    {
+        readPipe = 0;
+        writePipe = 0;
+
+        if (_winUsbHandle == IntPtr.Zero) return false;
+
+        if (!WinUsb_QueryInterfaceSettings(_winUsbHandle, 0, out USB_INTERFACE_DESCRIPTOR ifaceDescriptor))
+        {
+            Console.Error.WriteLine($"[WinUSB] WinUsb_QueryInterfaceSettings failed - error {Marshal.GetLastWin32Error()}");
+            return false;
+        }
+
+        for (byte i = 0; i < ifaceDescriptor.bNumEndpoints; i++)
+        {
+            if (WinUsb_QueryPipe(_winUsbHandle, 0, i, out WINUSB_PIPE_INFORMATION pipeInfo))
+            {
+                if (pipeInfo.PipeType == (byte)USBD_PIPE_TYPE.UsbdPipeTypeBulk)
+                {
+                    bool isRead = (pipeInfo.PipeId & 0x80) != 0;
+                    if (isRead)
+                    {
+                        readPipe = pipeInfo.PipeId;
+                        Console.WriteLine($"[WinUSB] Found bulk IN pipe: 0x{readPipe:X2}");
+                    }
+                    else
+                    {
+                        writePipe = pipeInfo.PipeId;
+                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2}");
+                    }
+                }
+            }
+        }
+
+        return readPipe != 0 && writePipe != 0;
+    }
+
+    public bool WritePipe(byte pipeId, byte[] buffer, int offset, int length, out uint transferred)
+    {
+        transferred = 0;
+        if (_winUsbHandle == IntPtr.Zero) return false;
+
+        byte[] slice = buffer;
+        if (offset != 0 || length != buffer.Length)
+        {
+            slice = new byte[length];
+            Buffer.BlockCopy(buffer, offset, slice, 0, length);
+        }
+
+        return WinUsb_WritePipe(_winUsbHandle, pipeId, slice, (uint)length, out transferred, IntPtr.Zero);
+    }
+
+    public bool ReadPipe(byte pipeId, byte[] buffer, int offset, int length, out uint transferred)
+    {
+        transferred = 0;
+        if (_winUsbHandle == IntPtr.Zero) return false;
+
+        byte[] slice = new byte[length];
+        bool success = WinUsb_ReadPipe(_winUsbHandle, pipeId, slice, (uint)length, out transferred, IntPtr.Zero);
+        
+        if (success && transferred > 0)
+        {
+            Buffer.BlockCopy(slice, 0, buffer, offset, (int)transferred);
+        }
+
+        return success;
     }
 
     public void Dispose()
