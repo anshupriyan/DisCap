@@ -193,13 +193,17 @@ public static class Program
             }
 
             var (phoneVid, phonePid) = detected.Value;
+            bool isAlreadyAoa = phoneVid == 0x18D1 && (phonePid == 0x2D00 || phonePid == 0x2D01);
 
             // Step 2: Install WinUSB for phone's normal VID/PID
-            if (!driverManager.EnsureWinUsbDriverInstalled(phoneVid, phonePid, "Discap AOAP"))
+            if (!isAlreadyAoa)
             {
-                Console.Error.WriteLine("[AOAP] Failed to install WinUSB driver for phone.");
-                Console.Error.WriteLine("[AOAP] Ensure drivers/Zadig.exe exists.");
-                return 1;
+                if (!driverManager.EnsureWinUsbDriverInstalled(phoneVid, phonePid, "Discap AOAP"))
+                {
+                    Console.Error.WriteLine("[AOAP] Failed to install WinUSB driver for phone.");
+                    Console.Error.WriteLine("[AOAP] Ensure drivers/Zadig.exe exists.");
+                    return 1;
+                }
             }
 
             // Step 3: Install WinUSB for Google AOA PIDs

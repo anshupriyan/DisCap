@@ -108,11 +108,11 @@ public sealed class AoapDriverManager
                 int vid = Convert.ToInt32(match.Groups[1].Value, 16);
                 int pid = Convert.ToInt32(match.Groups[2].Value, 16);
 
-                // Skip Google AOA PIDs — we want the phone's NORMAL VID/PID
+                // Check if already in AOA mode
                 if (vid == GoogleVendorId && (pid == AoaPid1 || pid == AoaPid2))
                 {
-                    Console.WriteLine($"[AOAP]   Skipping AOA device: VID=0x{vid:X4} PID=0x{pid:X4}");
-                    continue;
+                    Console.WriteLine($"[AOAP] Device already in AOA mode (VID=0x{vid:X4} PID=0x{pid:X4}) — skipping handshake, connecting directly");
+                    return (vid, pid);
                 }
 
                 if (androidVids.Contains(vid))
