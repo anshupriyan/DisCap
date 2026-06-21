@@ -375,6 +375,7 @@ public sealed class AoapDriverManager
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = _zadigPath,
+                    WorkingDirectory = Path.GetDirectoryName(_zadigPath), // Critical: Zadig needs to find zadig.ini next to it
                     UseShellExecute = true,  // Required for UAC elevation
                     Verb = "runas",          // Triggers UAC prompt
                 }
@@ -393,13 +394,20 @@ public sealed class AoapDriverManager
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
-            // ERROR_CANCELLED — user declined the UAC prompt
-            Console.Error.WriteLine("[AOAP]   User declined UAC elevation — Zadig was not launched.");
+            // ERROR_CANCELLED — normally means UAC was declined, but can also happen if ShellExecute fails silently
+            Console.Error.WriteLine($"[AOAP]   Zadig launch was cancelled (ERROR_CANCELLED).");
+            Console.Error.WriteLine($"[AOAP]     Type: {ex.GetType().Name}");
+            Console.Error.WriteLine($"[AOAP]     Message: {ex.Message}");
+            Console.Error.WriteLine($"[AOAP]     HResult: 0x{ex.HResult:X8}");
+            Console.Error.WriteLine($"[AOAP]     NativeErrorCode: {ex.NativeErrorCode}");
             return false;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[AOAP]   Failed to launch Zadig.exe: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[AOAP]   Failed to launch Zadig.exe:");
+            Console.Error.WriteLine($"[AOAP]     Type: {ex.GetType().Name}");
+            Console.Error.WriteLine($"[AOAP]     Message: {ex.Message}");
+            Console.Error.WriteLine($"[AOAP]     HResult: 0x{ex.HResult:X8}");
             return false;
         }
     }
