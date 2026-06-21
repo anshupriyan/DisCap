@@ -164,7 +164,20 @@ public sealed class UsbTransport : IDisposable
 
     private WinUsbDevice? FindAccessoryDevice()
     {
-        var devices = WinUsbDevice.EnumerateDevices(WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE);
+        var guidsToTry = new HashSet<Guid> { WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE };
+        
+        // Find any custom GUIDs registered specifically for the AOA MI_00 interfaces
+        var customGuids1 = WinUsbDevice.GetDeviceInterfaceGuids(GoogleVendorId, AccessoryPid1, 0);
+        var customGuids2 = WinUsbDevice.GetDeviceInterfaceGuids(GoogleVendorId, AccessoryPid2, 0);
+        foreach (var g in customGuids1) guidsToTry.Add(g);
+        foreach (var g in customGuids2) guidsToTry.Add(g);
+
+        var devices = new List<WinUsbDevice>();
+        foreach (var guid in guidsToTry)
+        {
+            devices.AddRange(WinUsbDevice.EnumerateDevices(guid));
+        }
+
         WinUsbDevice? bestMatch = null;
 
         foreach (var device in devices)

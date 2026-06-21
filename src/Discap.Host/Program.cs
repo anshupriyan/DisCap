@@ -211,7 +211,17 @@ public static class Program
             {
                 Console.WriteLine($"[AOAP] Device is in AOA mode. Verifying WinUSB driver is active for PID=0x{phonePid:X4}...");
                 bool isDriverValid = false;
-                var devices = WinUsbDevice.EnumerateDevices(WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE);
+                
+                var guidsToTry = new HashSet<Guid> { WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE };
+                var customGuids = WinUsbDevice.GetDeviceInterfaceGuids(phoneVid, phonePid, 0);
+                foreach (var g in customGuids) guidsToTry.Add(g);
+
+                var devices = new List<WinUsbDevice>();
+                foreach (var guid in guidsToTry)
+                {
+                    devices.AddRange(WinUsbDevice.EnumerateDevices(guid));
+                }
+
                 foreach (var dev in devices)
                 {
                     if (!isDriverValid && dev.Vid == phoneVid && dev.Pid == phonePid)
