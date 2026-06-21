@@ -46,62 +46,48 @@ public sealed class UsbTransport : IDisposable
         var accessoryDevice = FindAccessoryDevice();
         if (accessoryDevice != null)
         {
-            Console.WriteLine($"[USB] Found device already in accessory mode: VID=0x{accessoryDevice.Vid:X4} PID=0x{accessoryDevice.Pid:X4}");
+            Console.WriteLine($"[USB] Found device already in accessory mode");
         }
 
         if (accessoryDevice == null)
         {
             // Step 2: Try to find ANY Android device and put it into accessory mode
             Console.WriteLine("[USB] Step 2: Scanning for Android devices to switch to accessory mode...");
-            var allDevices = UsbDevice.AllWinUsbDevices;
-            Console.WriteLine($"[USB] Found {allDevices.Count} WinUSB device(s) total");
+            
+            // PHASE 1: WinUSB Enum Test
+            var usbGuid = WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE;
+            Console.WriteLine($"[USB] Enumerating with GUID: {usbGuid}");
+            var allDevices = WinUsbDevice.EnumerateDevices(usbGuid);
+            Console.WriteLine($"[USB] Found {allDevices.Count} raw WinUSB device(s) total");
+            
             bool sentAoaStart = false;
 
-            foreach (UsbRegistry registry in allDevices)
+            foreach (var device in allDevices)
             {
-                Console.WriteLine($"[USB]   Device: VID=0x{registry.Vid:X4} PID=0x{registry.Pid:X4}");
+                Console.WriteLine($"[USB]   Device: VID=0x{device.Vid:X4} PID=0x{device.Pid:X4} Path={device.DevicePath}");
 
-                if (registry.Vid == GoogleVendorId && (registry.Pid == AccessoryPid1 || registry.Pid == AccessoryPid2))
+                if (device.Vid == GoogleVendorId && (device.Pid == AccessoryPid1 || device.Pid == AccessoryPid2))
                 {
                     Console.WriteLine("[USB]   Skipping — already an accessory PID");
                     continue;
                 }
 
-                Console.WriteLine("[USB]   Attempting to open device...");
-                if (registry.Open(out UsbDevice tempDevice))
+                Console.WriteLine("[USB]   Attempting to open device handle and WinUSB_Initialize...");
+                if (device.Open())
                 {
-                    Console.WriteLine("[USB]   Device opened successfully");
-                    try
-                    {
-                        if (TryStartAccessoryMode(tempDevice))
-                        {
-                            Console.WriteLine("[USB] Sent AOA start command. Waiting for reconnection...");
-                            sentAoaStart = true;
-                            break; // Wait for it to reconnect
-                        }
-                        else
-                        {
-                            Console.WriteLine("[USB]   TryStartAccessoryMode returned false");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine($"[USB]   TryStartAccessoryMode threw exception: {ex.GetType().Name}: {ex.Message}");
-                    }
-                    finally
-                    {
-                        if (tempDevice.IsOpen) tempDevice.Close();
-                    }
+                    Console.WriteLine("[USB]   Device handle and WinUSB context successfully opened!");
+                    // For Phase 1, we stop here. We just want to prove we can see the device and open it via native WinUSB.
+                    device.Dispose();
                 }
                 else
                 {
-                    Console.Error.WriteLine("[USB]   Failed to open device (permissions? driver?)");
+                    Console.Error.WriteLine("[USB]   Failed to open device (expected for non-WinUSB devices like mice/keyboards)");
                 }
             }
 
             if (!sentAoaStart)
             {
-                Console.Error.WriteLine("[USB] No device accepted AOA handshake — giving up");
+                Console.Error.WriteLine("[USB] Phase 1 Test complete - Exiting early.");
                 return false;
             }
 
@@ -118,7 +104,7 @@ public sealed class UsbTransport : IDisposable
                 accessoryDevice = FindAccessoryDevice();
                 if (accessoryDevice != null)
                 {
-                    Console.WriteLine($"[USB] Accessory device appeared: VID=0x{accessoryDevice.Vid:X4} PID=0x{accessoryDevice.Pid:X4}");
+                    Console.WriteLine($"[USB] Accessory device appeared");
                     break;
                 }
                 Thread.Sleep(500);
@@ -132,6 +118,8 @@ public sealed class UsbTransport : IDisposable
             }
         }
 
+        // Phase 1 stop point
+#if false
         // Step 4: Open the accessory device and endpoints
         Console.WriteLine("[USB] Step 4: Opening accessory device and claiming interface...");
         if (accessoryDevice.Open(out _usbDevice))
@@ -169,17 +157,14 @@ public sealed class UsbTransport : IDisposable
 
         Console.Error.WriteLine("[USB] Failed to open accessory device");
         return false;
+#else
+        return false;
+#endif
     }
 
-    private UsbRegistry? FindAccessoryDevice()
+    // Placeholder for Phase 1
+    private object? FindAccessoryDevice()
     {
-        foreach (UsbRegistry registry in UsbDevice.AllDevices)
-        {
-            if (registry.Vid == GoogleVendorId && (registry.Pid == AccessoryPid1 || registry.Pid == AccessoryPid2))
-            {
-                return registry;
-            }
-        }
         return null;
     }
 
