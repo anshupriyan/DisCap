@@ -369,15 +369,14 @@ public sealed class AoapDriverManager
             Console.WriteLine("[AOAP] Waiting for Zadig to finish...");
             Console.WriteLine();
 
-            // Launch Zadig elevated (UseShellExecute required for Verb = "runas")
+            // Launch Zadig elevated (child inherits elevation from already-elevated parent)
             using var process = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = _zadigPath,
                     WorkingDirectory = Path.GetDirectoryName(_zadigPath), // Critical: Zadig needs to find zadig.ini next to it
-                    UseShellExecute = true,  // Required for UAC elevation
-                    Verb = "runas",          // Triggers UAC prompt
+                    UseShellExecute = true,  // Required for launching GUI apps cleanly
                 }
             };
 
