@@ -53,8 +53,8 @@ public sealed class UsbTransport : IDisposable
         {
             // Step 2: Try to find ANY Android device and put it into accessory mode
             Console.WriteLine("[USB] Step 2: Scanning for Android devices to switch to accessory mode...");
-            var allDevices = UsbDevice.AllDevices;
-            Console.WriteLine($"[USB] Found {allDevices.Count} USB device(s) total");
+            var allDevices = UsbDevice.AllWinUsbDevices;
+            Console.WriteLine($"[USB] Found {allDevices.Count} WinUSB device(s) total");
             bool sentAoaStart = false;
 
             foreach (UsbRegistry registry in allDevices)
