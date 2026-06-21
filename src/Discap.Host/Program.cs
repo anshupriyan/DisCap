@@ -207,10 +207,46 @@ public static class Program
             }
 
             // Step 3: Install WinUSB for Google AOA PIDs
-            if (!driverManager.EnsureAoaDriversInstalled())
+            if (isAlreadyAoa)
             {
-                Console.Error.WriteLine("[AOAP] Failed to install WinUSB for AOA PIDs.");
-                return 1;
+                Console.WriteLine($"[AOAP] Device is in AOA mode. Verifying WinUSB driver is active for PID=0x{phonePid:X4}...");
+                bool isDriverValid = false;
+                var devices = WinUsbDevice.EnumerateDevices(WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE);
+                foreach (var dev in devices)
+                {
+                    if (dev.Vid == phoneVid && dev.Pid == phonePid)
+                    {
+                        if (dev.Open())
+                        {
+                            isDriverValid = true;
+                            dev.Dispose();
+                            break;
+                        }
+                    }
+                    dev.Dispose();
+                }
+
+                if (!isDriverValid)
+                {
+                    Console.Error.WriteLine("[AOAP] Live check failed! WinUSB is NOT currently bound to this AOA PID.");
+                    if (!driverManager.EnsureWinUsbDriverInstalled(phoneVid, phonePid, "Discap AOA Mode", forceZadig: true))
+                    {
+                        Console.Error.WriteLine("[AOAP] Failed to force-install WinUSB for AOA PID.");
+                        return 1;
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("[AOAP] Live check passed! WinUSB is correctly bound.");
+                }
+            }
+            else
+            {
+                if (!driverManager.EnsureAoaDriversInstalled())
+                {
+                    Console.Error.WriteLine("[AOAP] Failed to install WinUSB for AOA PIDs.");
+                    return 1;
+                }
             }
 
             // Step 4: Wait a moment for driver to settle, then connect

@@ -194,6 +194,8 @@ public class WinUsbDevice : IDisposable
             return false;
         }
 
+        Console.WriteLine($"[WinUSB] CreateFile succeeded. Attempting WinUsb_Initialize for {DevicePath}...");
+
         if (!WinUsb_Initialize(_fileHandle, out _winUsbHandle))
         {
             Console.WriteLine($"[WinUSB] WinUsb_Initialize failed for {DevicePath} - error {Marshal.GetLastWin32Error()}");
@@ -201,6 +203,7 @@ public class WinUsbDevice : IDisposable
             return false;
         }
 
+        Console.WriteLine($"[WinUSB] WinUsb_Initialize succeeded.");
         return true;
     }
 
