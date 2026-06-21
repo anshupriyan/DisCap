@@ -153,16 +153,21 @@ public sealed class AoapDriverManager
     /// The user needs to click "Install Driver" once in the Zadig UI — this is NOT silent.
     /// Skips if the state file indicates installation was already done.
     /// </summary>
-    public bool EnsureWinUsbDriverInstalled(int vid, int pid, string deviceName)
+    public bool EnsureWinUsbDriverInstalled(int vid, int pid, string deviceName, bool forceZadig = false)
     {
         var state = LoadState();
 
         // Check if already installed
         string vidPidKey = $"{vid:X4}:{pid:X4}";
-        if (state.InstalledDevices.Contains(vidPidKey))
+        if (!forceZadig && state.InstalledDevices.Contains(vidPidKey))
         {
             Console.WriteLine($"[AOAP] WinUSB already installed for VID=0x{vid:X4} PID=0x{pid:X4} (cached)");
             return true;
+        }
+        
+        if (forceZadig)
+        {
+            Console.WriteLine($"[AOAP] Forcing Zadig installation for VID=0x{vid:X4} PID=0x{pid:X4} (ignoring cache)...");
         }
 
         // Verify Zadig.exe exists
