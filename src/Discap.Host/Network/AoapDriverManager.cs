@@ -14,19 +14,24 @@ namespace Discap.Host.Network;
 /// An Android phone in normal mode uses the ADB driver, so LibUsbDotNet can't enumerate it
 /// and can't send the AOA control transfers (51/52/53) needed to switch it to accessory mode.
 ///
-/// Solution: Use wdi-simple.exe (from libwdi, same engine as Zadig) to install WinUSB
-/// for the phone's VID/PID. This replaces the ADB driver — ADB and file transfer stop working,
-/// but LibUsbDotNet can now see the device and send AOA control transfers.
+/// Solution: Use Zadig.exe (from https://zadig.akeo.ie/) to install WinUSB for the phone's
+/// VID/PID. This replaces the ADB driver — ADB and file transfer stop working, but LibUsbDotNet
+/// can now see the device and send AOA control transfers.
+///
+/// The flow is semi-automated: we generate a zadig.ini config that pre-selects the right
+/// driver type and enables auto-exit on success. The user just needs to click "Install Driver"
+/// once in the Zadig UI window that appears.
 ///
 /// This class handles:
 /// 1. Detecting the phone's VID/PID via WMI (works regardless of current driver)
-/// 2. Installing WinUSB for the phone's normal VID/PID
-/// 3. Installing WinUSB for Google's AOA PIDs (0x18D1/0x2D00 and 0x18D1/0x2D01)
+/// 2. Generating zadig.ini and launching Zadig.exe for WinUSB installation
+/// 3. Pre-installing WinUSB for Google's AOA PIDs (0x18D1/0x2D00 and 0x18D1/0x2D01)
 /// 4. Printing revert instructions for switching back to ADB mode
 /// </summary>
 public sealed class AoapDriverManager
 {
-    private readonly string _wdiSimplePath;
+    private readonly string _zadigPath;
+    private readonly string _zadigIniPath;
     private readonly string _stateFilePath;
 
     private const int GoogleVendorId = 0x18D1;
@@ -36,8 +41,10 @@ public sealed class AoapDriverManager
     public AoapDriverManager()
     {
         var baseDir = AppContext.BaseDirectory;
-        _wdiSimplePath = Path.Combine(baseDir, "drivers", "wdi-simple.exe");
-        _stateFilePath = Path.Combine(baseDir, "drivers", "aoap_state.json");
+        var driversDir = Path.Combine(baseDir, "drivers");
+        _zadigPath = Path.Combine(driversDir, "Zadig.exe");
+        _zadigIniPath = Path.Combine(driversDir, "zadig.ini");
+        _stateFilePath = Path.Combine(driversDir, "aoap_state.json");
     }
 
     /// <summary>
@@ -129,8 +136,10 @@ public sealed class AoapDriverManager
     }
 
     /// <summary>
-    /// Ensures WinUSB is installed for a specific VID/PID using wdi-simple.exe.
-    /// Skips installation if the state file indicates it was already done.
+    /// Ensures WinUSB is installed for a specific VID/PID by launching Zadig.exe.
+    /// A zadig.ini is generated to pre-configure driver type and auto-exit on success.
+    /// The user needs to click "Install Driver" once in the Zadig UI — this is NOT silent.
+    /// Skips if the state file indicates installation was already done.
     /// </summary>
     public bool EnsureWinUsbDriverInstalled(int vid, int pid, string deviceName)
     {
@@ -144,14 +153,9 @@ public sealed class AoapDriverManager
             return true;
         }
 
-        // Verify wdi-simple.exe exists
-        if (!File.Exists(_wdiSimplePath))
-        {
-            Console.Error.WriteLine($"[AOAP] ERROR: wdi-simple.exe not found at: {_wdiSimplePath}");
-            Console.Error.WriteLine("[AOAP] Download it from https://github.com/pbatard/libwdi/releases");
-            Console.Error.WriteLine("[AOAP] Place it at: drivers/wdi-simple.exe");
+        // Verify Zadig.exe exists
+        if (!VerifyZadigExists())
             return false;
-        }
 
         // ── SAFETY WARNING ──
         Console.WriteLine();
@@ -170,10 +174,9 @@ public sealed class AoapDriverManager
         Console.WriteLine("╚══════════════════════════════════════════════════════════════════╝");
         Console.WriteLine();
 
-        // Run wdi-simple.exe
-        Console.WriteLine($"[AOAP] Running: wdi-simple.exe --vid 0x{vid:X4} --pid 0x{pid:X4} --type 0 --name \"{deviceName}\"");
-
-        bool success = RunWdiSimple($"--vid 0x{vid:X4} --pid 0x{pid:X4} --type 0 --name \"{deviceName}\"");
+        // Launch Zadig for this device
+        Console.WriteLine($"[AOAP] Installing WinUSB for VID=0x{vid:X4} PID=0x{pid:X4} \"{deviceName}\"");
+        bool success = LaunchZadig($"Install WinUSB for {deviceName} (VID=0x{vid:X4} PID=0x{pid:X4})");
         if (success)
         {
             state.InstalledDevices.Add(vidPidKey);
@@ -182,7 +185,7 @@ public sealed class AoapDriverManager
         }
         else
         {
-            Console.Error.WriteLine($"[AOAP] WinUSB driver installation FAILED for VID=0x{vid:X4} PID=0x{pid:X4}");
+            Console.Error.WriteLine($"[AOAP] WinUSB driver installation FAILED or was cancelled for VID=0x{vid:X4} PID=0x{pid:X4}");
         }
 
         return success;
@@ -192,6 +195,7 @@ public sealed class AoapDriverManager
     /// Pre-installs WinUSB for Google's AOA PIDs (0x18D1/0x2D00 and 0x18D1/0x2D01).
     /// These are the VID/PIDs the phone uses AFTER switching to accessory mode.
     /// Without WinUSB for these PIDs, the re-enumerated device won't be accessible.
+    /// Requires two separate Zadig launches (one per PID).
     /// </summary>
     public bool EnsureAoaDriversInstalled()
     {
@@ -202,21 +206,26 @@ public sealed class AoapDriverManager
             return true;
         }
 
-        if (!File.Exists(_wdiSimplePath))
+        if (!VerifyZadigExists())
+            return false;
+
+        Console.WriteLine("[AOAP] Installing WinUSB for Google AOA PIDs...");
+        Console.WriteLine("[AOAP] You will need to click 'Install Driver' in the Zadig window for each PID.");
+        Console.WriteLine();
+
+        // PID 0x2D00 — AOA mode only
+        Console.WriteLine($"[AOAP] Step 1/2: Installing for VID=0x{GoogleVendorId:X4} PID=0x{AoaPid1:X4} (AOA mode)...");
+        bool ok1 = LaunchZadig($"Install WinUSB for AOA mode (VID=0x{GoogleVendorId:X4} PID=0x{AoaPid1:X4})");
+
+        if (!ok1)
         {
-            Console.Error.WriteLine($"[AOAP] ERROR: wdi-simple.exe not found at: {_wdiSimplePath}");
+            Console.Error.WriteLine("[AOAP] Failed to install driver for AOA PID 0x2D00");
             return false;
         }
 
-        Console.WriteLine("[AOAP] Installing WinUSB for Google AOA PIDs...");
-
-        // PID 0x2D00 — AOA mode only
-        Console.WriteLine($"[AOAP] Installing for VID=0x{GoogleVendorId:X4} PID=0x{AoaPid1:X4} (AOA mode)...");
-        bool ok1 = RunWdiSimple($"--vid 0x{GoogleVendorId:X4} --pid 0x{AoaPid1:X4} --type 0 --name \"Discap AOA\"");
-
         // PID 0x2D01 — AOA + ADB mode
-        Console.WriteLine($"[AOAP] Installing for VID=0x{GoogleVendorId:X4} PID=0x{AoaPid2:X4} (AOA+ADB mode)...");
-        bool ok2 = RunWdiSimple($"--vid 0x{GoogleVendorId:X4} --pid 0x{AoaPid2:X4} --type 0 --name \"Discap AOA+ADB\"");
+        Console.WriteLine($"[AOAP] Step 2/2: Installing for VID=0x{GoogleVendorId:X4} PID=0x{AoaPid2:X4} (AOA+ADB mode)...");
+        bool ok2 = LaunchZadig($"Install WinUSB for AOA+ADB mode (VID=0x{GoogleVendorId:X4} PID=0x{AoaPid2:X4})");
 
         if (ok1 && ok2)
         {
@@ -289,43 +298,96 @@ public sealed class AoapDriverManager
     }
 
     /// <summary>
-    /// Runs wdi-simple.exe with the given arguments. Returns true on success.
+    /// Checks that Zadig.exe exists at the expected path.
     /// </summary>
-    private bool RunWdiSimple(string arguments)
+    private bool VerifyZadigExists()
+    {
+        if (File.Exists(_zadigPath))
+            return true;
+
+        Console.Error.WriteLine($"[AOAP] ERROR: Zadig.exe not found at: {_zadigPath}");
+        Console.Error.WriteLine("[AOAP] Download it from https://zadig.akeo.ie/downloads/");
+        Console.Error.WriteLine("[AOAP] Place it at: drivers/Zadig.exe");
+        return false;
+    }
+
+    /// <summary>
+    /// Generates a zadig.ini config file and launches Zadig.exe with UAC elevation.
+    /// The ini pre-configures Zadig to:
+    ///   - Show all devices (list_all = true)
+    ///   - Default to WinUSB driver (default_driver = 0)
+    ///   - Auto-exit on successful installation (exit_on_success = true)
+    ///   - Hide advanced mode to reduce confusion (advanced_mode = false)
+    /// 
+    /// The user must click "Install Driver" in the Zadig UI window.
+    /// Returns true if Zadig exits with code 0.
+    /// </summary>
+    private bool LaunchZadig(string contextMessage)
     {
         try
         {
-            Console.WriteLine($"[AOAP]   Executing: {_wdiSimplePath} {arguments}");
+            // Generate zadig.ini next to Zadig.exe
+            Console.WriteLine("[AOAP]   Generating zadig.ini configuration...");
+            string iniContent = """
+                [general]
+                advanced_mode = false
+                exit_on_success = true
+                log_level = 0
+                [device]
+                list_all = true
+                [driver]
+                default_driver = 0
+                """;
+            File.WriteAllText(_zadigIniPath, iniContent);
+            Console.WriteLine($"[AOAP]   Written zadig.ini to: {_zadigIniPath}");
 
+            // Print user instructions
+            Console.WriteLine();
+            Console.WriteLine($"[AOAP] Launching Zadig driver installer...");
+            Console.WriteLine($"[AOAP] Context: {contextMessage}");
+            Console.WriteLine("[AOAP] ┌─────────────────────────────────────────────────────────────┐");
+            Console.WriteLine("[AOAP] │  A Zadig window will open.                                 │");
+            Console.WriteLine("[AOAP] │                                                            │");
+            Console.WriteLine("[AOAP] │  1. Select your Android device from the dropdown           │");
+            Console.WriteLine("[AOAP] │  2. Ensure 'WinUSB' is selected as the target driver       │");
+            Console.WriteLine("[AOAP] │  3. Click 'Install Driver' (or 'Replace Driver')           │");
+            Console.WriteLine("[AOAP] │  4. Wait for installation to complete                      │");
+            Console.WriteLine("[AOAP] │  5. Zadig will close automatically on success              │");
+            Console.WriteLine("[AOAP] └─────────────────────────────────────────────────────────────┘");
+            Console.WriteLine("[AOAP] Waiting for Zadig to finish...");
+            Console.WriteLine();
+
+            // Launch Zadig elevated (UseShellExecute required for Verb = "runas")
             using var process = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
-                    FileName = _wdiSimplePath,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
+                    FileName = _zadigPath,
+                    UseShellExecute = true,  // Required for UAC elevation
+                    Verb = "runas",          // Triggers UAC prompt
                 }
             };
 
             process.Start();
-            string stdout = process.StandardOutput.ReadToEnd();
-            string stderr = process.StandardError.ReadToEnd();
-            process.WaitForExit(30_000); // 30 second timeout for driver install
+            process.WaitForExit(); // Wait indefinitely — user is interacting with UI
 
-            if (!string.IsNullOrWhiteSpace(stdout))
-                Console.WriteLine($"[AOAP]   stdout: {stdout.Trim()}");
-            if (!string.IsNullOrWhiteSpace(stderr))
-                Console.Error.WriteLine($"[AOAP]   stderr: {stderr.Trim()}");
+            Console.WriteLine($"[AOAP]   Zadig exit code: {process.ExitCode}");
 
-            Console.WriteLine($"[AOAP]   Exit code: {process.ExitCode}");
+            // Clean up the ini file
+            try { File.Delete(_zadigIniPath); }
+            catch { /* non-critical */ }
+
             return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            // ERROR_CANCELLED — user declined the UAC prompt
+            Console.Error.WriteLine("[AOAP]   User declined UAC elevation — Zadig was not launched.");
+            return false;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[AOAP]   Failed to run wdi-simple.exe: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[AOAP]   Failed to launch Zadig.exe: {ex.GetType().Name}: {ex.Message}");
             return false;
         }
     }

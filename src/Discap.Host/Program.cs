@@ -198,7 +198,7 @@ public static class Program
             if (!driverManager.EnsureWinUsbDriverInstalled(phoneVid, phonePid, "Discap AOAP"))
             {
                 Console.Error.WriteLine("[AOAP] Failed to install WinUSB driver for phone.");
-                Console.Error.WriteLine("[AOAP] Ensure drivers/wdi-simple.exe exists and app is running as admin.");
+                Console.Error.WriteLine("[AOAP] Ensure drivers/Zadig.exe exists.");
                 return 1;
             }
 
