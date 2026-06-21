@@ -22,9 +22,8 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
-  <ItemGroup>
+    <ItemGroup>
     <!-- DirectX / DXGI for Desktop Duplication -->
-    <PackageReference Include="LibUsbDotNet" Version="2.2.29" />
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.1" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.1" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.1" />
