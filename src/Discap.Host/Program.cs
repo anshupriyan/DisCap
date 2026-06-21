@@ -3,11 +3,11 @@ using Discap.Host.Capture;
 using Discap.Host.Compression;
 using Discap.Host.Config;
 using Discap.Host.Display;
+using Discap.Host.Network;
 using Discap.Host.Protocol;
 using Discap.Host.Transport;
 using Discap.Host.Input;
 using System.Net.Sockets;
-using Discap.Host.Network;
 
 namespace Discap.Host;
 
@@ -47,6 +47,7 @@ public static class Program
 
         Console.WriteLine($"[CFG] Resolution: {config.Width}x{config.Height} @ {config.RefreshRate}Hz");
         Console.WriteLine($"[CFG] Port: {config.Port}");
+        Console.WriteLine($"[CFG] Transport: {config.TransportMode.ToUpper()}");
         Console.WriteLine($"[CFG] Motion threshold: {config.MotionThreshold:P0}");
         Console.WriteLine($"[CFG] LZ4-only mode: {config.ForceLz4Only}");
         Console.WriteLine();
@@ -71,6 +72,14 @@ public static class Program
             catch { }
         }, null, 5000, 5000);
 
+
+        // ─── Handle --revert-driver (early exit) ──────────────────────
+        if (config.RevertDriver)
+        {
+            var driverMgr = new AoapDriverManager();
+            driverMgr.PrintRevertInstructions();
+            return 0;
+        }
 
         using var vddManager = new VirtualDisplayManager();
         using var duplicator = new DesktopDuplicator(config.AdapterIndex, config.CaptureTimeoutMs);
@@ -161,18 +170,67 @@ public static class Program
         Console.WriteLine("═══ Step 4: Transport ═══");
 
         Stream? clientStream = null;
-        
-        // Attempt AOA USB Bulk Transport First
-        bool usbActive = usbTransport.TryConnect(3000); // 3 seconds timeout
-        if (usbActive)
+        bool usbActive = false;
+
+        if (config.TransportMode == "aoap")
         {
-            Console.WriteLine("[USB] AOA bulk transfer active");
-            clientStream = usbTransport.Stream;
+            // ── AOAP Mode ─────────────────────────────────────────────
+            Console.WriteLine("[AOAP] AOAP transport mode selected");
+            Console.WriteLine("[AOAP] WARNING: This mode replaces your phone's USB driver.");
+            Console.WriteLine("[AOAP] ADB and file transfer will NOT work while active.");
+            Console.WriteLine("[AOAP] To revert: run with --revert-driver");
+            Console.WriteLine();
+
+            var driverManager = new AoapDriverManager();
+
+            // Step 1: Detect phone VID/PID via WMI
+            var detected = driverManager.DetectAndroidDeviceViaWmi();
+            if (detected == null)
+            {
+                Console.Error.WriteLine("[AOAP] No Android device detected via WMI.");
+                Console.Error.WriteLine("[AOAP] Connect your tablet via USB and try again.");
+                return 1;
+            }
+
+            var (phoneVid, phonePid) = detected.Value;
+
+            // Step 2: Install WinUSB for phone's normal VID/PID
+            if (!driverManager.EnsureWinUsbDriverInstalled(phoneVid, phonePid, "Discap AOAP"))
+            {
+                Console.Error.WriteLine("[AOAP] Failed to install WinUSB driver for phone.");
+                Console.Error.WriteLine("[AOAP] Ensure drivers/wdi-simple.exe exists and app is running as admin.");
+                return 1;
+            }
+
+            // Step 3: Install WinUSB for Google AOA PIDs
+            if (!driverManager.EnsureAoaDriversInstalled())
+            {
+                Console.Error.WriteLine("[AOAP] Failed to install WinUSB for AOA PIDs.");
+                return 1;
+            }
+
+            // Step 4: Wait a moment for driver to settle, then connect
+            Console.WriteLine("[AOAP] Drivers ready. Waiting 2s for driver to settle...");
+            await Task.Delay(2000);
+
+            // Step 5: AOA handshake (existing UsbTransport logic)
+            usbActive = usbTransport.TryConnect(20_000, isAoapMode: true); // 20s timeout for AOAP
+            if (usbActive)
+            {
+                Console.WriteLine("[AOAP] AOAP bulk transfer active");
+                clientStream = usbTransport.Stream;
+            }
+            else
+            {
+                Console.Error.WriteLine("[AOAP] AOA handshake failed after driver installation.");
+                Console.Error.WriteLine("[AOAP] The phone may need to be unplugged and replugged.");
+                Console.Error.WriteLine("[AOAP] Try running again — the driver is now installed.");
+                return 1;
+            }
         }
         else
         {
-            Console.WriteLine("[USB] AOA failed, falling back to ADB");
-            
+            // ── ADB Mode (default) ────────────────────────────────────
             if (!adbManager.FindAdb(config.AdbPath))
             {
                 Console.Error.WriteLine("[ADB] Cannot proceed without ADB.");
