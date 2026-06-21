@@ -181,9 +181,15 @@ public sealed class UsbTransport : IDisposable
         }
 
         WinUsbDevice? bestMatch = null;
+        var loggedPaths = new HashSet<string>();
 
         foreach (var device in devices)
         {
+            if (loggedPaths.Add(device.DevicePath))
+            {
+                Console.WriteLine($"[USB]   Poll Device: VID=0x{device.Vid:X4} PID=0x{device.Pid:X4} MI={(device.Mi.HasValue ? device.Mi.Value.ToString("X2") : "none")} Path={device.DevicePath}");
+            }
+
             if (device.Vid == GoogleVendorId && (device.Pid == AccessoryPid1 || device.Pid == AccessoryPid2))
             {
                 Console.WriteLine($"[USB]   Found AOA candidate: VID=0x{device.Vid:X4} PID=0x{device.Pid:X4} MI={(device.Mi.HasValue ? device.Mi.Value.ToString("X2") : "none")} Path={device.DevicePath}");
