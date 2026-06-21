@@ -37,6 +37,9 @@
 
     <!-- High-performance buffered I/O -->
     <PackageReference Include="System.IO.Pipelines" Version="9.0.0" />
+
+    <!-- WMI queries for AOAP device detection -->
+    <PackageReference Include="System.Management" Version="9.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -45,4 +48,12 @@
     </None>
   </ItemGroup>
 
+  <!-- AOAP driver bundle (wdi-simple.exe + state file) -->
+  <ItemGroup>
+    <None Include="drivers\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
+

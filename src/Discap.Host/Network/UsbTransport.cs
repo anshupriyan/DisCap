@@ -31,11 +31,14 @@ public sealed class UsbTransport : IDisposable
         _memoryStream = new UsbBulkStream(this);
     }
 
-    public bool TryConnect(int timeoutMs)
+    public bool TryConnect(int timeoutMs, bool isAoapMode = false)
     {
-        // Cap the timeout so AOA never delays startup too long.
-        timeoutMs = Math.Min(timeoutMs, MaxAoaAttemptMs);
-        Console.WriteLine($"[USB] Attempting AOA negotiation (timeout={timeoutMs}ms, max={MaxAoaAttemptMs}ms)...");
+        // In ADB fallback mode, cap the timeout. In AOAP mode, use the full timeout.
+        if (!isAoapMode)
+            timeoutMs = Math.Min(timeoutMs, MaxAoaAttemptMs);
+        
+        string modeLabel = isAoapMode ? "AOAP" : "AOA-fallback";
+        Console.WriteLine($"[USB] Attempting {modeLabel} negotiation (timeout={timeoutMs}ms)...");
         long start = Environment.TickCount64;
 
         // Step 1: Find if a device is ALREADY in accessory mode
@@ -105,8 +108,9 @@ public sealed class UsbTransport : IDisposable
             // Step 3: Wait for the device to reappear as an accessory.
             // The Android device disconnects from USB and reconnects as a new
             // device in accessory mode — this takes at least a few seconds.
-            Console.WriteLine("[USB] Step 3: Waiting 3s for device to re-enumerate in accessory mode...");
-            Thread.Sleep(3000); // Initial delay — device needs time to reboot into accessory mode
+            int initialDelayMs = isAoapMode ? 5000 : 3000;
+            Console.WriteLine($"[USB] Step 3: Waiting {initialDelayMs / 1000}s for device to re-enumerate in accessory mode...");
+            Thread.Sleep(initialDelayMs); // Initial delay — device needs time to reboot into accessory mode
 
             Console.WriteLine("[USB] Polling for accessory device (500ms interval)...");
             while (Environment.TickCount64 - start < timeoutMs)

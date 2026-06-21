@@ -66,8 +66,22 @@ public sealed class DiscapConfig
     public bool ForceLz4Only { get; set; } = false;
 
     /// <summary>
+    /// Transport mode: "adb" (default, safe) or "aoap" (USB accessory, requires WinUSB driver).
+    /// AOAP mode replaces the phone's ADB driver with WinUSB — ADB and file transfer
+    /// will NOT work while active. Only use when explicitly requested by the user.
+    /// </summary>
+    public string TransportMode { get; set; } = "adb";
+
+    /// <summary>
+    /// When true, prints step-by-step instructions for reverting the WinUSB driver
+    /// back to the stock ADB driver, then exits. Used after switching away from AOAP mode.
+    /// </summary>
+    public bool RevertDriver { get; set; } = false;
+
+    /// <summary>
     /// Parse command-line arguments into a DiscapConfig.
-    /// Supports: --width, --height, --fps, --port, --threshold, --adb, --lz4-only
+    /// Supports: --width, --height, --fps, --port, --threshold, --adb, --lz4-only,
+    ///           --transport, --revert-driver
     /// </summary>
     public static DiscapConfig FromArgs(string[] args)
     {
@@ -104,6 +118,16 @@ public sealed class DiscapConfig
                 case "--lz4-only":
                     config.ForceLz4Only = true;
                     break;
+                case "--transport" when i + 1 < args.Length:
+                    var mode = args[++i].ToLowerInvariant();
+                    if (mode is "adb" or "aoap")
+                        config.TransportMode = mode;
+                    else
+                        Console.Error.WriteLine($"[CFG] Unknown transport mode '{mode}', using 'adb'");
+                    break;
+                case "--revert-driver":
+                    config.RevertDriver = true;
+                    break;
                 case "--help":
                 case "-h":
                     PrintHelp();
@@ -133,13 +157,25 @@ public sealed class DiscapConfig
               --adb <path>          Path to adb.exe (default: auto-detect)
               --adapter <index>     GPU adapter index (default: 0)
               --lz4-only            Force LZ4-only mode, disable hardware encoding
+              --transport <mode>    Transport mode: 'adb' (default) or 'aoap'
+              --revert-driver       Print instructions to revert WinUSB → ADB driver
               --help, -h            Show this help message
 
+            Transport Modes:
+              adb   (default)  Uses ADB port forwarding over USB. Safe, works with
+                               all devices. ADB and file transfer remain functional.
+              aoap             Uses Android Open Accessory Protocol for direct USB
+                               bulk transfer. Requires WinUSB driver installation
+                               (replaces ADB driver). Lower latency, but ADB and
+                               file transfer will NOT work while active.
+
             Examples:
-              Discap.Host                                    # Default settings
+              Discap.Host                                    # Default (ADB mode)
+              Discap.Host --transport aoap                   # AOAP mode (first run installs driver)
+              Discap.Host --revert-driver                    # Revert to ADB driver
               Discap.Host --width 2560 --height 1600         # High-res tablet
               Discap.Host --lz4-only                         # LZ4 only, no NVENC
-              Discap.Host --port 9999 --fps 120              # Custom port and refresh rate
             """);
     }
 }
+
