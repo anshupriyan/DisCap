@@ -369,6 +369,9 @@ public sealed class AoapDriverManager
             Console.WriteLine("[AOAP] Waiting for Zadig to finish...");
             Console.WriteLine();
 
+            // Print absolute path for debugging
+            Console.WriteLine($"[AOAP]   Zadig absolute path: {_zadigPath}");
+
             // Launch Zadig elevated (child inherits elevation from already-elevated parent)
             using var process = new Process
             {
@@ -376,7 +379,7 @@ public sealed class AoapDriverManager
                 {
                     FileName = _zadigPath,
                     WorkingDirectory = Path.GetDirectoryName(_zadigPath), // Critical: Zadig needs to find zadig.ini next to it
-                    UseShellExecute = true,  // Required for launching GUI apps cleanly
+                    UseShellExecute = false, // Direct execution since we're already elevated, avoids ShellExecute ERROR_CANCELLED quirks
                 }
             };
 
