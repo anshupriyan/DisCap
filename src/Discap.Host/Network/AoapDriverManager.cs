@@ -92,6 +92,7 @@ public sealed class AoapDriverManager
                 0x2A45, // Meizu
                 0x1532, // Razer
                 0x2D95, // realme
+                0x17EF, // Lenovo
             };
 
             foreach (ManagementObject device in results)
@@ -116,7 +117,18 @@ public sealed class AoapDriverManager
 
                 if (androidVids.Contains(vid))
                 {
-                    Console.WriteLine($"[AOAP]   Found Android device: VID=0x{vid:X4} PID=0x{pid:X4} Name=\"{name}\"");
+                    Console.WriteLine($"[AOAP]   Found Android device (known VID): VID=0x{vid:X4} PID=0x{pid:X4} Name=\"{name}\"");
+                    Console.WriteLine($"[AOAP]   DeviceID: {deviceId}");
+                    return (vid, pid);
+                }
+                
+                // Fallback: Check if device name contains common Android keywords
+                if (name != null && (name.Contains("Android", StringComparison.OrdinalIgnoreCase) ||
+                                     name.Contains("Tab", StringComparison.OrdinalIgnoreCase) ||
+                                     name.Contains("Phone", StringComparison.OrdinalIgnoreCase) ||
+                                     name.Contains("Pad", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Console.WriteLine($"[AOAP]   Found Android device (name heuristic): VID=0x{vid:X4} PID=0x{pid:X4} Name=\"{name}\"");
                     Console.WriteLine($"[AOAP]   DeviceID: {deviceId}");
                     return (vid, pid);
                 }
