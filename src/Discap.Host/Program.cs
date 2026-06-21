@@ -214,13 +214,17 @@ public static class Program
                 var devices = WinUsbDevice.EnumerateDevices(WinUsbDevice.GUID_DEVINTERFACE_USB_DEVICE);
                 foreach (var dev in devices)
                 {
-                    if (dev.Vid == phoneVid && dev.Pid == phonePid)
+                    if (!isDriverValid && dev.Vid == phoneVid && dev.Pid == phonePid)
                     {
-                        if (dev.Open())
+                        Console.WriteLine($"[AOAP]   Live Check Candidate: VID=0x{dev.Vid:X4} PID=0x{dev.Pid:X4} MI={(dev.Mi.HasValue ? dev.Mi.Value.ToString("X2") : "none")} Path={dev.DevicePath}");
+                        
+                        // We strictly want MI_00 if it exists, or no MI if simple device
+                        if (dev.Mi == 0 || !dev.Mi.HasValue)
                         {
-                            isDriverValid = true;
-                            dev.Dispose();
-                            break;
+                            if (dev.Open())
+                            {
+                                isDriverValid = true;
+                            }
                         }
                     }
                     dev.Dispose();
