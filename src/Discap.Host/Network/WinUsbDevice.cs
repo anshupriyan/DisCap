@@ -76,13 +76,13 @@ public class WinUsbDevice : IDisposable
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public struct WINUSB_PIPE_INFORMATION
     {
-        public byte PipeType;
+        public USBD_PIPE_TYPE PipeType;
         public byte PipeId;
         public ushort MaximumPacketSize;
         public byte Interval;
     }
 
-    public enum USBD_PIPE_TYPE : byte
+    public enum USBD_PIPE_TYPE : uint
     {
         UsbdPipeTypeControl,
         UsbdPipeTypeIsochronous,
@@ -291,7 +291,7 @@ public class WinUsbDevice : IDisposable
         {
             if (WinUsb_QueryPipe(_winUsbHandle, 0, i, out WINUSB_PIPE_INFORMATION pipeInfo))
             {
-                if (pipeInfo.PipeType == (byte)USBD_PIPE_TYPE.UsbdPipeTypeBulk)
+                if (pipeInfo.PipeType == USBD_PIPE_TYPE.UsbdPipeTypeBulk)
                 {
                     bool isRead = (pipeInfo.PipeId & 0x80) != 0;
                     if (isRead)
