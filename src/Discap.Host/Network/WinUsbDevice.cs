@@ -49,6 +49,15 @@ public class WinUsbDevice : IDisposable
     [DllImport("winusb.dll", SetLastError = true)]
     private static extern bool WinUsb_WritePipe(IntPtr InterfaceHandle, byte PipeID, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
 
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_SetPipePolicy(IntPtr InterfaceHandle, byte PipeID, uint PolicyType, uint ValueLength, ref byte Value);
+
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_SetPipePolicy(IntPtr InterfaceHandle, byte PipeID, uint PolicyType, uint ValueLength, ref uint Value);
+
+    public const uint POLICY_PIPE_TRANSFER_TIMEOUT = 0x03;
+    public const uint POLICY_RAW_IO = 0x07;
+
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public struct WINUSB_SETUP_PACKET
     {
@@ -274,10 +283,11 @@ public class WinUsbDevice : IDisposable
         return WinUsb_ControlTransfer(_winUsbHandle, setupPacket, buffer ?? Array.Empty<byte>(), bufferLength, out lengthTransferred, IntPtr.Zero);
     }
 
-    public bool DiscoverPipes(out byte readPipe, out byte writePipe)
+    public bool DiscoverPipes(out byte readPipe, out byte writePipe, out ushort writeMaxPacketSize)
     {
         readPipe = 0;
         writePipe = 0;
+        writeMaxPacketSize = 512;
 
         if (_winUsbHandle == IntPtr.Zero) return false;
 
@@ -297,12 +307,26 @@ public class WinUsbDevice : IDisposable
                     if (isRead)
                     {
                         readPipe = pipeInfo.PipeId;
-                        Console.WriteLine($"[WinUSB] Found bulk IN pipe: 0x{readPipe:X2}");
+                        Console.WriteLine($"[WinUSB] Found bulk IN pipe: 0x{readPipe:X2} (MaxPacketSize: {pipeInfo.MaximumPacketSize})");
                     }
                     else
                     {
                         writePipe = pipeInfo.PipeId;
-                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2}");
+                        writeMaxPacketSize = pipeInfo.MaximumPacketSize;
+                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2} (MaxPacketSize: {pipeInfo.MaximumPacketSize})");
+
+                        // Apply Optimizations to OUT pipe
+                        byte rawIo = 1;
+                        if (!WinUsb_SetPipePolicy(_winUsbHandle, writePipe, POLICY_RAW_IO, 1, ref rawIo))
+                        {
+                            Console.WriteLine($"[WinUSB] Warning: Failed to enable RAW_IO on OUT pipe - error {Marshal.GetLastWin32Error()}");
+                        }
+
+                        uint timeoutMs = 5000;
+                        if (!WinUsb_SetPipePolicy(_winUsbHandle, writePipe, POLICY_PIPE_TRANSFER_TIMEOUT, 4, ref timeoutMs))
+                        {
+                            Console.WriteLine($"[WinUSB] Warning: Failed to set TRANSFER_TIMEOUT on OUT pipe - error {Marshal.GetLastWin32Error()}");
+                        }
                     }
                 }
             }
