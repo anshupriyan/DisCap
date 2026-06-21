@@ -2,15 +2,17 @@ using System;
 using System.IO;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
 
 namespace Discap.Host.Network;
 
 public sealed class UsbTransport : IDisposable
 {
     private WinUsbDevice? _accessoryDevice;
-    private byte _writePipe;
-    private byte _readPipe;
     private bool _connected;
+    private byte _readPipe;
+    private byte _writePipe;
+    private ushort _writeMaxPacketSize;
     
     private const int GoogleVendorId = 0x18D1;
     private const int AccessoryPid1 = 0x2D00;
@@ -143,9 +145,9 @@ public sealed class UsbTransport : IDisposable
             _accessoryDevice = accessoryDevice;
 
             Console.WriteLine("[USB] Discovering endpoints...");
-            if (_accessoryDevice.DiscoverPipes(out _readPipe, out _writePipe))
+            if (_accessoryDevice.DiscoverPipes(out _readPipe, out _writePipe, out _writeMaxPacketSize))
             {
-                Console.WriteLine($"[USB] Endpoints discovered: OUT=0x{_writePipe:X2}, IN=0x{_readPipe:X2}");
+                Console.WriteLine($"[USB] Endpoints discovered: OUT=0x{_writePipe:X2}, IN=0x{_readPipe:X2}, MaxPacketSize={_writeMaxPacketSize}");
                 _connected = true;
                 long totalMs = Environment.TickCount64 - start;
                 Console.WriteLine($"[USB] AOA connection established in {totalMs}ms");
@@ -307,11 +309,30 @@ public sealed class UsbTransport : IDisposable
     {
         if (_accessoryDevice == null || !_connected) throw new InvalidOperationException("Not connected");
         
-        bool result = _accessoryDevice.WritePipe(_writePipe, buffer, offset, count, out uint sent);
+        // Chunk writes to a multiple of MaximumPacketSize. Using 32KB chunks as a good balance for bulk.
+        int chunkSize = Math.Max((int)_writeMaxPacketSize, 32768);
+        // Ensure it's exactly a multiple of _writeMaxPacketSize
+        chunkSize = (chunkSize / _writeMaxPacketSize) * _writeMaxPacketSize;
         
-        if (!result || sent != count)
+        int bytesWritten = 0;
+        while (bytesWritten < count)
         {
-            throw new IOException($"USB write failed. Sent {sent} of {count} bytes.");
+            int currentChunk = Math.Min(chunkSize, count - bytesWritten);
+            long startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            bool result = _accessoryDevice.WritePipe(_writePipe, buffer, offset + bytesWritten, currentChunk, out uint sent);
+            
+            long endTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            double ms = (endTicks - startTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+            Console.WriteLine($"[WinUSB] Chunk write: {sent} bytes in {ms:F2}ms");
+
+            if (!result || sent != currentChunk)
+            {
+                throw new IOException($"USB write failed at offset {bytesWritten}. Sent {sent} of {currentChunk} bytes.");
+            }
+
+            bytesWritten += (int)sent;
         }
     }
 
