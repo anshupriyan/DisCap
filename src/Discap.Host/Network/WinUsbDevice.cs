@@ -127,6 +127,57 @@ public class WinUsbDevice : IDisposable
         Mi = mi;
     }
 
+    public static List<Guid> GetDeviceInterfaceGuids(int vid, int pid, int? mi = null)
+    {
+        var guids = new List<Guid>();
+        try
+        {
+            using var usbKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USB");
+            if (usbKey == null) return guids;
+
+            string searchStr = $"VID_{vid:X4}&PID_{pid:X4}";
+            if (mi.HasValue)
+            {
+                searchStr += $"&MI_{mi.Value:X2}";
+            }
+
+            foreach (var devId in usbKey.GetSubKeyNames())
+            {
+                if (devId.IndexOf(searchStr, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    using var devKey = usbKey.OpenSubKey(devId);
+                    if (devKey == null) continue;
+
+                    foreach (var instanceId in devKey.GetSubKeyNames())
+                    {
+                        using var instanceKey = devKey.OpenSubKey(instanceId);
+                        using var paramKey = instanceKey?.OpenSubKey("Device Parameters");
+                        if (paramKey != null)
+                        {
+                            object? val = paramKey.GetValue("DeviceInterfaceGUIDs") ?? paramKey.GetValue("DeviceInterfaceGUID");
+                            if (val is string[] arr)
+                            {
+                                foreach (var s in arr)
+                                {
+                                    if (Guid.TryParse(s, out Guid g)) guids.Add(g);
+                                }
+                            }
+                            else if (val is string str)
+                            {
+                                if (Guid.TryParse(str, out Guid g)) guids.Add(g);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WinUSB] Failed to read registry for device GUIDs: {ex.Message}");
+        }
+        return guids;
+    }
+
     public static List<WinUsbDevice> EnumerateDevices(Guid interfaceGuid)
     {
         var devices = new List<WinUsbDevice>();
