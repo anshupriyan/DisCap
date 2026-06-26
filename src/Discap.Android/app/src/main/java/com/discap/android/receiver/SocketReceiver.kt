@@ -79,6 +79,7 @@ class SocketReceiver(
                 var statsBytes = 0L
                 var statsStartNs = System.nanoTime()
                 var streamBaseUs: Long? = null
+                var lastTimestampUs: Long = -1
 
                 while (isRunning) {
                     // Read exactly 32 bytes of header
@@ -128,7 +129,10 @@ class SocketReceiver(
                         lz4Decoder?.decode(payloadBuffer, compressedSize, originalSize)
                     }
 
-                    statsFrames++
+                    if (timestampUs != lastTimestampUs) {
+                        statsFrames++
+                        lastTimestampUs = timestampUs
+                    }
                     statsBytes += 32L + compressedSize
                     val nowNs = System.nanoTime()
                     val nowUs = nowNs / 1000
@@ -137,7 +141,7 @@ class SocketReceiver(
                     }
 
                     val statsElapsedNs = nowNs - statsStartNs
-                    if (statsElapsedNs >= 250_000_000L) {
+                    if (statsElapsedNs >= 1_000_000_000L) {
                         val elapsedSec = statsElapsedNs / 1_000_000_000.0
                         val fps = statsFrames / elapsedSec
                         val bitrate = statsBytes * 8.0 / elapsedSec / 1_000_000.0

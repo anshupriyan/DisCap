@@ -387,9 +387,60 @@ public sealed class HardwareEncoder : IVideoEncoder
         return -1;
     }
 
-    public void SetTargetBitrate(int bitrate)
+    public unsafe void Reconfigure(int bps, int fps)
     {
-        // Reconfiguration omitted for brevity, fallback to CBR
+        if (!_available || (_bitrate == bps && _frameRate == fps)) return;
+        
+        int mbps = bps / 1_000_000;
+        _bitrate = bps;
+        _frameRate = fps;
+
+        var presetConfig = new NvEncPresetConfig
+        {
+            Version = LibNvEnc.NV_ENC_PRESET_CONFIG_VER,
+            PresetCfg = new NvEncConfig { Version = LibNvEnc.NV_ENC_CONFIG_VER }
+        };
+
+        var status = LibNvEnc.FunctionList.GetEncodePresetConfigEx(_encoder, NvEncCodecGuids.H264, NvEncPresetGuids.P3, (uint)NvEncTuningInfo.LowLatency, ref presetConfig);
+        if (status != NvEncStatus.Success) return;
+
+        var initParams = new NvEncInitializeParams
+        {
+            Version = LibNvEnc.NV_ENC_INITIALIZE_PARAMS_VER,
+            EncodeGuid = NvEncCodecGuids.H264,
+            PresetGuid = NvEncPresetGuids.P3,
+            TuningInfo = NvEncTuningInfo.LowLatency,
+            EncodeWidth = (uint)_width,
+            EncodeHeight = (uint)_height,
+            DarWidth = (uint)_width,
+            DarHeight = (uint)_height,
+            FrameRateNum = (uint)_frameRate,
+            FrameRateDen = 1,
+            EnableEncodeAsync = 1,
+            EnablePTD = 1,
+            ReportSliceOffsets = false,
+            MaxEncodeWidth = (uint)_width,
+            MaxEncodeHeight = (uint)_height
+        };
+
+        initParams.EncodeConfig = &presetConfig.PresetCfg;
+        initParams.EncodeConfig->RcParams.RateControlMode = NvEncParamsRcMode.Cbr;
+        initParams.EncodeConfig->RcParams.AverageBitRate = (uint)_bitrate;
+        initParams.EncodeConfig->RcParams.MaxBitRate = (uint)_bitrate;
+        initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
+        initParams.EncodeConfig->GopLength = 120;
+        initParams.EncodeConfig->FrameIntervalP = 1;
+
+        var reconfigParams = new NvEncReconfigureParams
+        {
+            Version = LibNvEnc.NV_ENC_RECONFIGURE_PARAMS_VER,
+            ReInitEncodeParams = initParams,
+            ResetEncoder = true,
+            ForceIDR = true
+        };
+
+        status = LibNvEnc.FunctionList.ReconfigureEncoder(_encoder, ref reconfigParams);
+        Console.WriteLine($"[ENC] Bitrate updated: {mbps}Mbps → {bps}bps, reconfigure result: {status}");
     }
 
     public void ForceKeyFrame()

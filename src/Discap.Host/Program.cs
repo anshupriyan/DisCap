@@ -355,8 +355,11 @@ public static class Program
             long lastFpsTime = Stopwatch.GetTimestamp();
             int lz4Frames = 0;
             int nvencFrames = 0;
+            int nalCounter = 0;
             long totalBytesSent = 0;
-            long lastSentTicks = 0;
+            long nextFrameDueTicks = 0;
+            long lastLoopTicks = streamStartTime;
+            long totalLoopIntervalTicks = 0;
             encoder.ForceKeyFrame();
 
             int droppedFrames = 0;
@@ -373,16 +376,29 @@ public static class Program
                 if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
 
                 int fpsCap = streamSettings.FpsCap;
-                if (fpsCap > 0 && lastSentTicks != 0)
+                long currentLoopTicks = Stopwatch.GetTimestamp();
+                if (loopIteration > 1)
+                {
+                    totalLoopIntervalTicks += (currentLoopTicks - lastLoopTicks);
+                }
+                lastLoopTicks = currentLoopTicks;
+                long currentCaptureTicks = Stopwatch.GetTimestamp();
+
+                if (fpsCap > 0 && nextFrameDueTicks != 0)
+                {
+                    if (currentCaptureTicks < nextFrameDueTicks - (Stopwatch.Frequency / 1000))
+                    {
+                        continue;
+                    }
+                }
+                
+                if (fpsCap > 0)
                 {
                     long minFrameTicks = Stopwatch.Frequency / fpsCap;
-                    long elapsedSinceSend = Stopwatch.GetTimestamp() - lastSentTicks;
-                    long remainingTicks = minFrameTicks - elapsedSinceSend;
-                    if (remainingTicks > 0)
-                    {
-                        int delayMs = Math.Max(1, (int)(remainingTicks * 1000 / Stopwatch.Frequency));
-                        await Task.Delay(delayMs);
-                    }
+                    if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
+                        nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
+                    else
+                        nextFrameDueTicks += minFrameTicks;
                 }
 
                 // Capture next frame.
@@ -444,7 +460,7 @@ public static class Program
                 // Compress or encode the frame.
                 if (frameType == FrameType.NVENC && nvencAvailable)
                 {
-                    encoder.SetTargetBitrate(GetTargetBitrate(streamSettings.BitrateMbps, dirtyRatio, config.MotionThreshold));
+                    encoder.Reconfigure(GetTargetBitrate(streamSettings.BitrateMbps, dirtyRatio, config.MotionThreshold), fpsCap);
                     Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
                     encoder.SubmitFrame(frame);
                     Console.WriteLine($"[ENC] {loopIteration}: SubmitFrame returned");
@@ -455,6 +471,7 @@ public static class Program
                     while (encoder.TryGetNextPacket(out compressedData, out compressedSize, sentAny ? 0 : 100))
                     {
                         sentAny = true;
+                        nalCounter++;
                         
                         long elapsedTicks = frame.TimestampTicks - streamStartTime;
                         long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
@@ -484,8 +501,7 @@ public static class Program
                             Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Encode: {encodeMs:F2}ms | Send: {sendMs:F2}ms");
 
                             totalBytesSent += PacketHeader.SIZE + compressedSize;
-                            lastSentTicks = Stopwatch.GetTimestamp();
-                            totalSendTicks += (lastSentTicks - sendStartTicks);
+                            totalSendTicks += (tSendEnd - sendStartTicks);
                         }
                         catch (Exception)
                         {
@@ -532,9 +548,9 @@ public static class Program
                 try
                 {
                     packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
+                    long tSendEnd = Stopwatch.GetTimestamp();
                     totalBytesSent += PacketHeader.SIZE + compressedSize;
-                    lastSentTicks = Stopwatch.GetTimestamp();
-                    totalSendTicks += (lastSentTicks - lz4SendStartTicks);
+                    totalSendTicks += (tSendEnd - lz4SendStartTicks);
                 }
                 catch (Exception)
                 {
@@ -558,14 +574,24 @@ public static class Program
                     // The exact STATS format requested
                     Console.WriteLine($"[STATS] FPS: {fps:F0} | Encoder: {encName} | Avg frame: {avgFrameKb:F0}KB | Encode time: {avgEncodeMs:F1}ms | Send time: {avgSendMs:F1}ms | Dropped: {droppedFrames} | Net: {mbps:F1} Mbps");
 
+                    int currentFpsCap = streamSettings.FpsCap;
+                    long minTicks = currentFpsCap > 0 ? Stopwatch.Frequency / currentFpsCap : 0;
+                    Console.WriteLine($"[FPS] Target: {currentFpsCap} | Actual interval: {minTicks} ticks | Measured FPS: {fps:F0}");
+                    Console.WriteLine($"[ENC-STATS] Encoder Output FPS: {nvencFrames}");
+
+                    double avgLoopMs = totalLoopIntervalTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, fpsCounter);
+                    Console.WriteLine($"[PERF] Encode: {nalCounter} NAL/s | Transport write: {avgSendMs:F2}ms | Loop interval: {avgLoopMs:F2}ms | Target: {currentFpsCap}fps");
+
                     fpsCounter = 0;
                     lastFpsTime = now;
                     lz4Frames = 0;
                     nvencFrames = 0;
+                    nalCounter = 0;
                     totalBytesSent = 0;
                     droppedFrames = 0;
                     totalEncodeTicks = 0;
                     totalSendTicks = 0;
+                    totalLoopIntervalTicks = 0;
                 }
             }
 
@@ -593,7 +619,7 @@ public static class Program
 
     private static int GetTargetBitrate(int requestedMbps, float dirtyRatio, float motionThreshold)
     {
-        int requested = Math.Clamp(requestedMbps, 5, 50) * 1_000_000;
+        int requested = Math.Clamp(requestedMbps, 5, 100) * 1_000_000;
         return dirtyRatio >= motionThreshold ? requested : Math.Min(requested, 8_000_000);
     }
 
@@ -632,7 +658,7 @@ public static class Program
 
         public StreamSettings(int bitrateMbps, int fpsCap, int resolutionScale, int encoderMode, bool showStats)
         {
-            _bitrateMbps = Math.Clamp(bitrateMbps, 5, 50);
+            _bitrateMbps = Math.Clamp(bitrateMbps, 5, 100);
             _fpsCap = NormalizeFps(fpsCap);
             _resolutionScale = NormalizeScale(resolutionScale);
             _encoderMode = NormalizeEncoderMode(encoderMode);
@@ -647,7 +673,7 @@ public static class Program
 
         public void Update(ControlPacket packet)
         {
-            _bitrateMbps = Math.Clamp(packet.BitrateMbps, (byte)5, (byte)50);
+            _bitrateMbps = Math.Clamp(packet.BitrateMbps, (byte)5, (byte)100);
             _fpsCap = NormalizeFps(packet.FpsCap);
             _resolutionScale = NormalizeScale(packet.ResolutionScale);
             _encoderMode = NormalizeEncoderMode(packet.EncoderMode);
@@ -658,6 +684,7 @@ public static class Program
         {
             30 => 30,
             120 => 120,
+            144 => 144,
             _ => 60
         };
 

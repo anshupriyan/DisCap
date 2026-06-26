@@ -42,6 +42,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        
+        val display = windowManager.defaultDisplay
+        val modes = display.supportedModes
+        var maxHz = 0f
+        var bestMode = -1
+        for (mode in modes) {
+            if (mode.refreshRate > maxHz) {
+                maxHz = mode.refreshRate
+                bestMode = mode.modeId
+            }
+        }
+        val params = window.attributes
+        if (bestMode != -1) {
+            params.preferredDisplayModeId = bestMode
+        }
+        window.attributes = params
+        Log.i("Discap", "[SURF] Supported modes: ${modes.joinToString { "${it.refreshRate}Hz" }}, Selected best mode: $maxHz Hz")
+        
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 or View.SYSTEM_UI_FLAG_FULLSCREEN
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
@@ -112,7 +130,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             bitrateValue = label("${bitrateMbps} Mbps")
             addView(bitrateValue)
             addView(SeekBar(this@MainActivity).apply {
-                max = 45
+                max = 95
                 progress = bitrateMbps - 5
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -126,7 +144,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             })
 
             addView(label("FPS cap"))
-            addView(buttonRow(listOf("30" to 30, "60" to 60, "120" to 120)) { fpsCap = it })
+            addView(buttonRow(listOf("30" to 30, "60" to 60, "120" to 120, "144" to 144)) { fpsCap = it })
 
             addView(label("Resolution scale"))
             addView(buttonRow(listOf("50%" to 50, "75%" to 75, "100%" to 100)) {

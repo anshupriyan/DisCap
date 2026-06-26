@@ -82,7 +82,7 @@ public class WinUsbDevice : IDisposable
         public byte iInterface;
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    [StructLayout(LayoutKind.Sequential)]
     public struct WINUSB_PIPE_INFORMATION
     {
         public USBD_PIPE_TYPE PipeType;
@@ -312,8 +312,8 @@ public class WinUsbDevice : IDisposable
                     else
                     {
                         writePipe = pipeInfo.PipeId;
-                        writeMaxPacketSize = 512; // HARDCODED for testing
-                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2} (MaxPacketSize: 512 (Hardcoded) from {pipeInfo.MaximumPacketSize})");
+                        writeMaxPacketSize = pipeInfo.MaximumPacketSize;
+                        Console.WriteLine($"[WinUSB] Found bulk OUT pipe: 0x{writePipe:X2} (MaxPacketSize: {writeMaxPacketSize})");
 
                         // Apply Optimizations to OUT pipe
                         byte rawIo = 1;
