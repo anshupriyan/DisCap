@@ -165,7 +165,7 @@ public sealed class FfmpegEncoder : IVideoEncoder
     }
 
     public void ForceKeyFrame() { }
-    public void SetTargetBitrate(int bitrate) { }
+    public void Reconfigure(int bitrate, int fps) { }
 
     public void Dispose()
     {

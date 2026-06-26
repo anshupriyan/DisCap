@@ -14,6 +14,11 @@ public sealed class UsbTransport : IDisposable
     private byte _writePipe;
     private ushort _writeMaxPacketSize;
     
+    // Chunk stats
+    private long _totalBytes;
+    private int _chunkWrites;
+    private double _totalChunkMs;
+    
     private const int GoogleVendorId = 0x18D1;
     private const int AccessoryPid1 = 0x2D00;
     private const int AccessoryPid2 = 0x2D01;
@@ -331,7 +336,9 @@ public sealed class UsbTransport : IDisposable
             long endTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             double ms = (endTicks - startTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
-            Console.WriteLine($"[WinUSB] Chunk write: {sent} bytes in {ms:F2}ms");
+            _totalChunkMs += ms;
+            _chunkWrites++;
+            _totalBytes += sent;
 
             if (!result || sent != currentChunk)
             {
@@ -340,6 +347,15 @@ public sealed class UsbTransport : IDisposable
 
             bytesWritten += (int)sent;
         }
+    }
+
+    public void PopStats(out long bytes, out double avgChunkMs)
+    {
+        bytes = _totalBytes;
+        avgChunkMs = _chunkWrites > 0 ? _totalChunkMs / _chunkWrites : 0;
+        _totalBytes = 0;
+        _chunkWrites = 0;
+        _totalChunkMs = 0;
     }
 
     public void Dispose()

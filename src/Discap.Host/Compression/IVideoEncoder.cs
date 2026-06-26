@@ -9,6 +9,6 @@ public interface IVideoEncoder : IDisposable
     bool Initialize(int width, int height, int frameRate = 60, int bitrate = 8_000_000);
     void SubmitFrame(FrameBuffer frame);
     bool TryGetNextPacket(out byte[] naluData, out int naluSize, int timeoutMs);
-    void SetTargetBitrate(int bitrate);
+    void Reconfigure(int bitrate, int fps);
     void ForceKeyFrame();
 }
