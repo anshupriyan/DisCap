@@ -93,7 +93,7 @@ public static class Program
         var packetWriter = new PacketWriter();
         var streamSettings = new StreamSettings(
             config.Bitrate / 1_000_000,
-            config.RefreshRate,
+            0,  // Native — no FPS cap, matches display refresh rate
             100,
             ControlPacket.EncoderAuto,
             false);
@@ -140,7 +140,7 @@ public static class Program
         bool nvencAvailable = false;
         if (!config.ForceLz4Only)
         {
-            nvencAvailable = encoder.Initialize(duplicator.Width, duplicator.Height, config.RefreshRate, config.Bitrate);
+            nvencAvailable = encoder.Initialize(duplicator.Width, duplicator.Height, duplicator.CurrentRefreshRate, config.Bitrate);
             if (nvencAvailable && encoder is HardwareEncoder hw)
             {
                 nvencAvailable = hw.OpenDevice(duplicator.Device!.NativePointer);
@@ -155,7 +155,7 @@ public static class Program
                 Console.WriteLine("[ENC] HardwareEncoder initialization failed, falling back to ffmpeg.");
                 encoder.Dispose();
                 encoder = new FfmpegEncoder();
-                nvencAvailable = encoder.Initialize(duplicator.Width, duplicator.Height, config.RefreshRate, config.Bitrate);
+                nvencAvailable = encoder.Initialize(duplicator.Width, duplicator.Height, duplicator.CurrentRefreshRate, config.Bitrate);
             }
         }
         else
@@ -376,6 +376,8 @@ public static class Program
                 if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
 
                 int fpsCap = streamSettings.FpsCap;
+                // When Native (0), pace to the display's actual refresh rate
+                int effectivePacingFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
                 long currentLoopTicks = Stopwatch.GetTimestamp();
                 if (loopIteration > 1)
                 {
@@ -384,7 +386,7 @@ public static class Program
                 lastLoopTicks = currentLoopTicks;
                 long currentCaptureTicks = Stopwatch.GetTimestamp();
 
-                if (fpsCap > 0 && nextFrameDueTicks != 0)
+                if (effectivePacingFps > 0 && nextFrameDueTicks != 0)
                 {
                     if (currentCaptureTicks < nextFrameDueTicks - (Stopwatch.Frequency / 1000))
                     {
@@ -392,9 +394,9 @@ public static class Program
                     }
                 }
                 
-                if (fpsCap > 0)
+                if (effectivePacingFps > 0)
                 {
-                    long minFrameTicks = Stopwatch.Frequency / fpsCap;
+                    long minFrameTicks = Stopwatch.Frequency / effectivePacingFps;
                     if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
                         nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
                     else
@@ -430,6 +432,69 @@ public static class Program
                     continue;
                 }
 
+                // Check if resolution or refresh rate changed mid-stream (e.g. user changed OS settings)
+                if (nvencAvailable && (frame.Width != encoder.CurrentWidth || frame.Height != encoder.CurrentHeight || duplicator.CurrentRefreshRate != encoder.CurrentFrameRate))
+                {
+                    Console.WriteLine($"[ENC] Display change detected: {encoder.CurrentWidth}x{encoder.CurrentHeight}@{encoder.CurrentFrameRate}Hz -> {frame.Width}x{frame.Height}@{duplicator.CurrentRefreshRate}Hz");
+                    Console.WriteLine("[ENC] Reinitializing encoder...");
+                    
+                    bool wasHardware = encoder is HardwareEncoder;
+                    encoder.Dispose();
+                    
+                    bool initSuccess = false;
+                    try
+                    {
+                        if (wasHardware)
+                        {
+                            var hw = new HardwareEncoder();
+                            encoder = hw;
+                            initSuccess = hw.Initialize(frame.Width, frame.Height, duplicator.CurrentRefreshRate, GetTargetBitrate(streamSettings.BitrateMbps, 1.0f, config.MotionThreshold));
+                            if (initSuccess)
+                            {
+                                initSuccess = hw.OpenDevice(duplicator.Device!.NativePointer);
+                            }
+                            
+                            if (!initSuccess)
+                            {
+                                Console.WriteLine("[ENC] HardwareEncoder reinitialization failed, falling back to ffmpeg.");
+                                encoder.Dispose();
+                                var ff = new FfmpegEncoder();
+                                encoder = ff;
+                                initSuccess = ff.Initialize(frame.Width, frame.Height, duplicator.CurrentRefreshRate, GetTargetBitrate(streamSettings.BitrateMbps, 1.0f, config.MotionThreshold));
+                            }
+                        }
+                        else
+                        {
+                            var ff = new FfmpegEncoder();
+                            encoder = ff;
+                            initSuccess = ff.Initialize(frame.Width, frame.Height, duplicator.CurrentRefreshRate, GetTargetBitrate(streamSettings.BitrateMbps, 1.0f, config.MotionThreshold));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[ENC] Exception during encoder reinitialization: {ex.Message}");
+                        initSuccess = false;
+                    }
+
+                    if (!initSuccess)
+                    {
+                        Console.Error.WriteLine("[ENC] Error: Failed to reinitialize encoder after display change.");
+                        Console.Error.WriteLine("[ENC] Stopping stream gracefully.");
+                        _running = false;
+                        break;
+                    }
+                    
+                    // The new encoder needs a keyframe
+                    encoder.ForceKeyFrame();
+                }
+
+                // If encoder is unavailable (e.g. still initializing), skip frame
+                if (nvencAvailable && !encoder.IsAvailable)
+                {
+                    Console.WriteLine($"[LOOP] {loopIteration}: Encoder not available, skipping frame");
+                    continue;
+                }
+
                 // For NVENC, always encode regardless of dirty-area — DXGI dirty rects are
                 // unreliable and were silently killing the stream after the first IDR.
                 // For LZ4-only mode, skip unchanged frames to save bandwidth.
@@ -460,7 +525,8 @@ public static class Program
                 // Compress or encode the frame.
                 if (frameType == FrameType.NVENC && nvencAvailable)
                 {
-                    encoder.Reconfigure(GetTargetBitrate(streamSettings.BitrateMbps, dirtyRatio, config.MotionThreshold), fpsCap);
+                    int effectiveFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
+                    encoder.Reconfigure(GetTargetBitrate(streamSettings.BitrateMbps, dirtyRatio, config.MotionThreshold), effectiveFps);
                     Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
                     encoder.SubmitFrame(frame);
                     Console.WriteLine($"[ENC] {loopIteration}: SubmitFrame returned");
@@ -564,6 +630,9 @@ public static class Program
                 long elapsed = now - lastFpsTime;
                 if (elapsed >= Stopwatch.Frequency) // 1 second
                 {
+                    // Re-query OS refresh rate to detect midstream changes
+                    duplicator.RefreshCurrentRefreshRate();
+                    
                     double fps = fpsCounter * (double)Stopwatch.Frequency / elapsed;
                     double mbps = totalBytesSent * 8.0 / 1_000_000;
                     double avgFrameKb = totalBytesSent / 1024.0 / Math.Max(1, fpsCounter);
@@ -575,12 +644,13 @@ public static class Program
                     Console.WriteLine($"[STATS] FPS: {fps:F0} | Encoder: {encName} | Avg frame: {avgFrameKb:F0}KB | Encode time: {avgEncodeMs:F1}ms | Send time: {avgSendMs:F1}ms | Dropped: {droppedFrames} | Net: {mbps:F1} Mbps");
 
                     int currentFpsCap = streamSettings.FpsCap;
-                    long minTicks = currentFpsCap > 0 ? Stopwatch.Frequency / currentFpsCap : 0;
-                    Console.WriteLine($"[FPS] Target: {currentFpsCap} | Actual interval: {minTicks} ticks | Measured FPS: {fps:F0}");
+                    int currentEffectiveFps = currentFpsCap > 0 ? currentFpsCap : duplicator.CurrentRefreshRate;
+                    string fpsCapLabel = currentFpsCap == 0 ? $"Native ({duplicator.CurrentRefreshRate}Hz)" : $"{currentFpsCap}";
+                    Console.WriteLine($"[FPS] Display refresh rate: {duplicator.CurrentRefreshRate}Hz | App FPS cap: {fpsCapLabel} | Effective pacing: {currentEffectiveFps}fps | Measured: {fps:F0}fps");
                     Console.WriteLine($"[ENC-STATS] Encoder Output FPS: {nvencFrames}");
 
                     double avgLoopMs = totalLoopIntervalTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, fpsCounter);
-                    Console.WriteLine($"[PERF] Encode: {nalCounter} NAL/s | Transport write: {avgSendMs:F2}ms | Loop interval: {avgLoopMs:F2}ms | Target: {currentFpsCap}fps");
+                    Console.WriteLine($"[PERF] Encode: {nalCounter} NAL/s | Transport write: {avgSendMs:F2}ms | Loop interval: {avgLoopMs:F2}ms | Target: {currentEffectiveFps}fps");
 
                     fpsCounter = 0;
                     lastFpsTime = now;
@@ -682,6 +752,7 @@ public static class Program
 
         private static int NormalizeFps(int fps) => fps switch
         {
+            0 => 0,    // Native — no cap, matches display refresh rate
             30 => 30,
             120 => 120,
             144 => 144,

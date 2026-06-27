@@ -42,10 +42,15 @@ public sealed class HardwareEncoder : IVideoEncoder
     /// <summary>Set by the capture loop before each SubmitFrame call so encoder logs carry the same iteration number.</summary>
     public long DiagIteration { get; set; }
 
+    public int CurrentWidth => _width;
+    public int CurrentHeight => _height;
+    public int CurrentFrameRate { get; private set; }
+
     public unsafe bool Initialize(int width, int height, int frameRate = 60, int bitrate = 8_000_000)
     {
         _width = width;
         _height = height;
+        CurrentFrameRate = frameRate;
         _bitrate = bitrate;
         _frameRate = frameRate;
 

@@ -22,6 +22,38 @@ namespace Discap.Host.Capture;
 /// </summary>
 public sealed class DesktopDuplicator : IDisposable
 {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion;
+        public short dmDriverVersion;
+        public short dmSize;
+        public short dmDriverExtra;
+        public int dmFields;
+        public int dmPositionX;
+        public int dmPositionY;
+        public int dmDisplayOrientation;
+        public int dmDisplayFixedOutput;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels;
+        public int dmBitsPerPel;
+        public int dmPelsWidth;
+        public int dmPelsHeight;
+        public int dmDisplayFlags;
+        public int dmDisplayFrequency;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+
+    private const int ENUM_CURRENT_SETTINGS = -1;
+
     private ID3D11Device? _device;
     private ID3D11DeviceContext? _context;
     private IDXGIOutputDuplication? _duplication;
@@ -41,6 +73,7 @@ public sealed class DesktopDuplicator : IDisposable
     private int _width;
     private int _height;
     private readonly int _timeoutMs;
+    private string _deviceName = string.Empty;
 
     /// <summary>Width of the captured output in pixels.</summary>
     public int Width => _width;
@@ -51,8 +84,10 @@ public sealed class DesktopDuplicator : IDisposable
     /// <summary>X offset of the captured output on the virtual desktop.</summary>
     public int BoundsX { get; private set; }
 
-    /// <summary>Y offset of the captured output on the virtual desktop.</summary>
+    /// <summary>Y coordinate of the captured output on the virtual desktop.</summary>
     public int BoundsY { get; private set; }
+    
+    public int CurrentRefreshRate { get; private set; }
 
     /// <summary>Whether the duplicator is initialized and ready to capture.</summary>
     public bool IsInitialized => _duplication != null;
@@ -147,9 +182,20 @@ public sealed class DesktopDuplicator : IDisposable
             BoundsY = outputDesc.DesktopCoordinates.Top;
             _width = outputDesc.DesktopCoordinates.Right - outputDesc.DesktopCoordinates.Left;
             _height = outputDesc.DesktopCoordinates.Bottom - outputDesc.DesktopCoordinates.Top;
+            
+            DEVMODE dm = new DEVMODE();
+            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            int refreshRate = 60; // fallback
+            _deviceName = outputDesc.DeviceName;
+            if (EnumDisplaySettings(_deviceName, ENUM_CURRENT_SETTINGS, ref dm))
+            {
+                refreshRate = dm.dmDisplayFrequency;
+            }
+            CurrentRefreshRate = refreshRate;
+            
             output.Dispose();
 
-            Console.WriteLine($"[CAP] Output resolution: {_width}x{_height} at {BoundsX},{BoundsY}");
+            Console.WriteLine($"[CAP] Virtual display active at {_width}x{_height} @ {refreshRate}Hz");
 
             _duplication = output1.DuplicateOutput(_device);
 
@@ -463,6 +509,28 @@ public sealed class DesktopDuplicator : IDisposable
         Console.WriteLine("[CAP] Reinitializing Desktop Duplication...");
         Thread.Sleep(500); // Brief pause before retry.
         Initialize(_outputIndex);
+    }
+
+    /// <summary>
+    /// Re-queries the current display refresh rate from the OS without
+    /// reinitializing the duplication session. Call periodically (e.g.
+    /// once per second) to detect midstream refresh rate changes.
+    /// </summary>
+    public void RefreshCurrentRefreshRate()
+    {
+        if (string.IsNullOrEmpty(_deviceName)) return;
+        
+        var dm = new DEVMODE();
+        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        if (EnumDisplaySettings(_deviceName, ENUM_CURRENT_SETTINGS, ref dm))
+        {
+            int newRate = dm.dmDisplayFrequency;
+            if (newRate != CurrentRefreshRate)
+            {
+                Console.WriteLine($"[CAP] Refresh rate changed: {CurrentRefreshRate}Hz -> {newRate}Hz");
+                CurrentRefreshRate = newRate;
+            }
+        }
     }
 
     private void Cleanup()

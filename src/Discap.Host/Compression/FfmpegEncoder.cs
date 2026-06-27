@@ -9,15 +9,19 @@ public sealed class FfmpegEncoder : IVideoEncoder
 {
     private Process? _ffmpeg;
     private bool _available;
-    
     private Thread? _readerThread;
     private CancellationTokenSource _cts = new CancellationTokenSource();
     private BlockingCollection<byte[]> _naluQueue = new BlockingCollection<byte[]>(new ConcurrentQueue<byte[]>());
-
     public bool IsAvailable => _available;
+    public int CurrentWidth { get; private set; }
+    public int CurrentHeight { get; private set; }
+    public int CurrentFrameRate { get; private set; }
 
     public bool Initialize(int width, int height, int frameRate = 60, int bitrate = 8_000_000)
     {
+        CurrentWidth = width;
+        CurrentHeight = height;
+        CurrentFrameRate = frameRate;
         try
         {
             _ffmpeg = new Process();

@@ -13,6 +13,7 @@ import kotlin.math.max
 
 class SocketReceiver(
     private val surface: Surface,
+    private val onVideoSizeChanged: ((Int, Int) -> Unit)? = null,
     private val statsCallback: ((FrameStats) -> Unit)? = null
 ) {
 
@@ -80,6 +81,8 @@ class SocketReceiver(
                 var statsStartNs = System.nanoTime()
                 var streamBaseUs: Long? = null
                 var lastTimestampUs: Long = -1
+                var lastWidth = 0
+                var lastHeight = 0
 
                 while (isRunning) {
                     // Read exactly 32 bytes of header
@@ -109,6 +112,12 @@ class SocketReceiver(
 
                     // Read exactly compressedSize bytes of payload
                     input.readFully(payloadBuffer, 0, compressedSize)
+                    
+                    if (width != lastWidth || height != lastHeight) {
+                        lastWidth = width
+                        lastHeight = height
+                        onVideoSizeChanged?.invoke(width, height)
+                    }
                     
                     Log.i("Discap.Net", "[RCV] Packet received: type=$frameType size=$compressedSize")
 

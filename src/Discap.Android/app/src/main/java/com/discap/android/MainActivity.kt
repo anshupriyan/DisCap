@@ -33,7 +33,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var isUsbMode = false
 
     private var bitrateMbps = 20
-    private var fpsCap = 60
+    private var fpsCap = 0  // 0 = Native (no cap, matches display refresh rate)
     private var resolutionScale = 100
     private var encoderMode = ENCODER_AUTO
     private var showStats = false
@@ -143,8 +143,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 })
             })
 
-            addView(label("FPS cap"))
-            addView(buttonRow(listOf("30" to 30, "60" to 60, "120" to 120, "144" to 144)) { fpsCap = it })
+            addView(label("FPS cap (Native = matches display refresh rate)"))
+            addView(buttonRow(listOf("Native" to 0, "30" to 30, "60" to 60, "120" to 120, "144" to 144)) { fpsCap = it })
 
             addView(label("Resolution scale"))
             addView(buttonRow(listOf("50%" to 50, "75%" to 75, "100%" to 100)) {
@@ -241,7 +241,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         if (!isUsbMode) {
             Log.i("Discap", "Starting SocketReceiver (ADB Fallback)...")
-            socketReceiver = SocketReceiver(holder.surface) { stats ->
+            socketReceiver = SocketReceiver(holder.surface, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
                 runOnUiThread {
                     statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
                             "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType}"
@@ -263,6 +263,33 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         socketReceiver = null
         usbReceiver?.stop()
         usbReceiver = null
+    }
+
+    private fun handleVideoSizeChanged(videoWidth: Int, videoHeight: Int) {
+        runOnUiThread {
+            if (videoWidth == 0 || videoHeight == 0) return@runOnUiThread
+            
+            val parent = surfaceView.parent as? View ?: return@runOnUiThread
+            val parentWidth = parent.width
+            val parentHeight = parent.height
+            if (parentWidth == 0 || parentHeight == 0) return@runOnUiThread
+            
+            val videoRatio = videoWidth.toFloat() / videoHeight.toFloat()
+            val screenRatio = parentWidth.toFloat() / parentHeight.toFloat()
+            
+            val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
+            if (videoRatio > screenRatio) {
+                // Video is wider than screen -> letterbox (black bars top/bottom)
+                lp.width = parentWidth
+                lp.height = (parentWidth / videoRatio).toInt()
+            } else {
+                // Video is taller than screen -> pillarbox (black bars left/right)
+                lp.width = (parentHeight * videoRatio).toInt()
+                lp.height = parentHeight
+            }
+            lp.gravity = Gravity.CENTER
+            surfaceView.layoutParams = lp
+        }
     }
 
     override fun onDestroy() {
@@ -296,7 +323,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 socketReceiver = null
 
                 usbReceiver?.stop()
-                usbReceiver = UsbReceiver(pfd, surfaceView.holder.surface) { stats ->
+                usbReceiver = UsbReceiver(pfd, surfaceView.holder.surface, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
                     runOnUiThread {
                         statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
                                 "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType} (USB)"

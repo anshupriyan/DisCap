@@ -15,6 +15,7 @@ import kotlin.math.max
 class UsbReceiver(
     private val pfd: ParcelFileDescriptor,
     private val surface: Surface,
+    private val onVideoSizeChanged: ((Int, Int) -> Unit)? = null,
     private val statsCallback: ((SocketReceiver.FrameStats) -> Unit)? = null
 ) {
     private var isRunning = false
@@ -50,6 +51,8 @@ class UsbReceiver(
             var statsStartNs = System.nanoTime()
             var streamBaseUs: Long? = null
             var lastTimestampUs: Long = -1
+            var lastWidth = 0
+            var lastHeight = 0
 
             while (isRunning) {
                 input.readFully(headerBuffer)
@@ -74,6 +77,12 @@ class UsbReceiver(
                 }
 
                 input.readFully(payloadBuffer, 0, compressedSize)
+
+                if (width != lastWidth || height != lastHeight) {
+                    lastWidth = width
+                    lastHeight = height
+                    onVideoSizeChanged?.invoke(width, height)
+                }
 
                 if (frameType.toInt() == 2) {
                     if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
