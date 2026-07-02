@@ -43,6 +43,7 @@ public sealed class FrameBuffer : IDisposable
 
     public double CaptureTimeMs { get; set; }
     public double ConvertTimeMs { get; set; }
+    public double ReadbackTimeMs { get; set; }
 
     /// <summary>Rectangles that changed since the previous frame (from DXGI dirty rects).</summary>
     public RawRect[] DirtyRects { get; set; } = Array.Empty<RawRect>();

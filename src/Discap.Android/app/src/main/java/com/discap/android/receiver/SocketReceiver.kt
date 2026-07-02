@@ -129,7 +129,7 @@ class SocketReceiver(
                             h264Decoder = H264Decoder(surface, width, height)
                             h264Decoder?.start()
                         }
-                        h264Decoder?.decode(payloadBuffer, 0, compressedSize)
+                        h264Decoder?.decode(payloadBuffer, 0, compressedSize, timestampUs)
                     } else if (frameType.toInt() == 1) {
                         // LZ4
                         if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {

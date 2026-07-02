@@ -82,17 +82,18 @@ class SocketSender {
         fpsCap: Int,
         resolutionScale: Int,
         encoderMode: Int,
-        showStats: Boolean
+        showStats: Boolean,
+        cqLevel: Int
     ) {
         val buffer = ByteArray(12)
         val bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN)
         bb.putInt(0x4C525443) // "CTRL"
-        bb.put(bitrateMbps.coerceIn(5, 50).toByte())
+        bb.put(bitrateMbps.coerceIn(5, 150).toByte())
         bb.put(fpsCap.toByte())
         bb.put(resolutionScale.toByte())
         bb.put(encoderMode.toByte())
         bb.put(if (showStats) 1 else 0)
-        bb.put(0)
+        bb.put(cqLevel.toByte())
         bb.put(0)
         bb.put(0)
         lastSettingsPacket = buffer

@@ -79,6 +79,14 @@ public sealed class DiscapConfig
     public bool RevertDriver { get; set; } = false;
 
     /// <summary>
+    /// NVENC rate control mode: "vbr" (default), "cbr", or "vbr-hq".
+    /// vbr: Variable bitrate (current default behavior).
+    /// cbr: Constant bitrate — eliminates QP hunting, steady stream.
+    /// vbr-hq: VBR with two-pass quarter-resolution lookahead for better quality.
+    /// </summary>
+    public string RcMode { get; set; } = "vbr";
+
+    /// <summary>
     /// Parse command-line arguments into a DiscapConfig.
     /// Supports: --width, --height, --fps, --port, --threshold, --adb, --lz4-only,
     ///           --transport, --revert-driver
@@ -128,6 +136,13 @@ public sealed class DiscapConfig
                 case "--revert-driver":
                     config.RevertDriver = true;
                     break;
+                case "--rc-mode" when i + 1 < args.Length:
+                    var rcMode = args[++i].ToLowerInvariant();
+                    if (rcMode is "vbr" or "cbr" or "vbr-hq")
+                        config.RcMode = rcMode;
+                    else
+                        Console.Error.WriteLine($"[CFG] Unknown rc-mode '{rcMode}', using 'vbr'. Valid: vbr, cbr, vbr-hq");
+                    break;
                 case "--help":
                 case "-h":
                     PrintHelp();
@@ -159,6 +174,7 @@ public sealed class DiscapConfig
               --lz4-only            Force LZ4-only mode, disable hardware encoding
               --transport <mode>    Transport mode: 'adb' (default) or 'aoap'
               --revert-driver       Print instructions to revert WinUSB → ADB driver
+              --rc-mode <mode>      NVENC rate control: 'vbr' (default), 'cbr', 'vbr-hq'
               --help, -h            Show this help message
 
             Transport Modes:

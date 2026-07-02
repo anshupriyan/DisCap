@@ -36,6 +36,8 @@ public sealed class HardwareEncoder : IVideoEncoder
     private int _height;
     private int _bitrate;
     private int _frameRate;
+    private string _rcMode = "vbr";
+    private byte _targetQuality = 28; // Default CQ = 28
     
     private byte[] _outputBuffer = new byte[1024 * 1024 * 2]; // 2MB max frame size
 
@@ -45,6 +47,8 @@ public sealed class HardwareEncoder : IVideoEncoder
     public int CurrentWidth => _width;
     public int CurrentHeight => _height;
     public int CurrentFrameRate { get; private set; }
+    public int LastNalType { get; private set; }
+    public int LastFrameSize { get; private set; }
 
     public unsafe bool Initialize(int width, int height, int frameRate = 60, int bitrate = 8_000_000)
     {
@@ -65,9 +69,10 @@ public sealed class HardwareEncoder : IVideoEncoder
         return true;
     }
 
-    public unsafe bool OpenDevice(IntPtr d3d11DeviceHandle)
+    public unsafe bool OpenDevice(IntPtr d3d11DeviceHandle, string rcMode = "vbr")
     {
         if (!_available) return false;
+        _rcMode = rcMode;
 
         var openParams = new NvEncOpenEncodeSessionExParams
         {
@@ -84,6 +89,9 @@ public sealed class HardwareEncoder : IVideoEncoder
             _available = false;
             return false;
         }
+
+        // ── Diagnostic: query NVENC capabilities (YUV444 support, input formats) ──
+        QueryEncoderCaps();
 
         var presetConfig = new NvEncPresetConfig
         {
@@ -118,9 +126,7 @@ public sealed class HardwareEncoder : IVideoEncoder
         };
 
         initParams.EncodeConfig = &presetConfig.PresetCfg;
-        initParams.EncodeConfig->RcParams.RateControlMode = NvEncParamsRcMode.Cbr;
-        initParams.EncodeConfig->RcParams.AverageBitRate = 8000000;
-        initParams.EncodeConfig->RcParams.MaxBitRate = 8000000;
+        ApplyRateControl(initParams.EncodeConfig, (uint)_bitrate, _rcMode, _targetQuality);
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
         initParams.EncodeConfig->GopLength = 120;
         initParams.EncodeConfig->FrameIntervalP = 1; // B-frames = 0
@@ -166,6 +172,7 @@ public sealed class HardwareEncoder : IVideoEncoder
         }
 
         Console.WriteLine("[ENC] NVENC Session configured for D3D11 NV12 streaming (async mode).");
+        Console.WriteLine($"[ENC] Rate control: {_rcMode.ToUpper()} | Average: {_bitrate / 1_000_000}Mbps | Max: 150Mbps");
         return true;
     }
 
@@ -284,6 +291,8 @@ public sealed class HardwareEncoder : IVideoEncoder
                 nalType = _outputBuffer[3] & 0x1F;
                 
             Console.WriteLine($"[ENC] NAL type={nalType} size={naluSize} bytes");
+            LastNalType = nalType;
+            LastFrameSize = naluSize;
             // If queue is now empty, the pending output has been fully drained.
             if (_naluQueue.Count == 0) _frameSubmitted = false;
             return true;
@@ -348,6 +357,8 @@ public sealed class HardwareEncoder : IVideoEncoder
                 nalType = _outputBuffer[3] & 0x1F;
                 
             Console.WriteLine($"[ENC] NAL type={nalType} size={naluSize} bytes");
+            LastNalType = nalType;
+            LastFrameSize = naluSize;
             // If queue is now empty, the pending output has been fully drained.
             if (_naluQueue.Count == 0) _frameSubmitted = false;
             return true;
@@ -392,13 +403,14 @@ public sealed class HardwareEncoder : IVideoEncoder
         return -1;
     }
 
-    public unsafe void Reconfigure(int bps, int fps)
+    public unsafe void Reconfigure(int bps, int fps, byte targetQuality = 0)
     {
-        if (!_available || (_bitrate == bps && _frameRate == fps)) return;
+        if (!_available || (_bitrate == bps && _frameRate == fps && _targetQuality == targetQuality)) return;
         
         int mbps = bps / 1_000_000;
         _bitrate = bps;
         _frameRate = fps;
+        _targetQuality = targetQuality;
 
         var presetConfig = new NvEncPresetConfig
         {
@@ -429,9 +441,7 @@ public sealed class HardwareEncoder : IVideoEncoder
         };
 
         initParams.EncodeConfig = &presetConfig.PresetCfg;
-        initParams.EncodeConfig->RcParams.RateControlMode = NvEncParamsRcMode.Cbr;
-        initParams.EncodeConfig->RcParams.AverageBitRate = (uint)_bitrate;
-        initParams.EncodeConfig->RcParams.MaxBitRate = (uint)_bitrate;
+        ApplyRateControl(initParams.EncodeConfig, (uint)_bitrate, _rcMode, _targetQuality);
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
         initParams.EncodeConfig->GopLength = 120;
         initParams.EncodeConfig->FrameIntervalP = 1;
@@ -445,7 +455,87 @@ public sealed class HardwareEncoder : IVideoEncoder
         };
 
         status = LibNvEnc.FunctionList.ReconfigureEncoder(_encoder, ref reconfigParams);
-        Console.WriteLine($"[ENC] Bitrate updated: {mbps}Mbps → {bps}bps, reconfigure result: {status}");
+        Console.WriteLine($"[ENC] Bitrate updated: {mbps}Mbps → {bps}bps, quality={targetQuality}, reconfigure result: {status}");
+        Console.WriteLine($"[ENC] Rate control: {_rcMode.ToUpper()} | Average: {bps / 1_000_000}Mbps | Max: 150Mbps | TargetQuality: {targetQuality}");
+    }
+
+    /// <summary>
+    /// Applies rate control parameters based on the selected mode.
+    /// Shared by both initial config and reconfigure paths.
+    /// </summary>
+    private static unsafe void ApplyRateControl(NvEncConfig* config, uint averageBitRate, string rcMode, byte targetQuality)
+    {
+        switch (rcMode)
+        {
+            case "cbr":
+                config->RcParams.RateControlMode = NvEncParamsRcMode.Cbr;
+                config->RcParams.AverageBitRate = averageBitRate;
+                config->RcParams.MaxBitRate = averageBitRate; // CBR: avg == max
+                config->RcParams.MultiPass = NvEncMultiPass.Disabled;
+                break;
+            case "vbr-hq":
+                config->RcParams.RateControlMode = NvEncParamsRcMode.Vbr;
+                config->RcParams.AverageBitRate = averageBitRate;
+                config->RcParams.MaxBitRate = 150_000_000;
+                config->RcParams.MultiPass = NvEncMultiPass.NvEncTwoPassQuarterResolution;
+                config->RcParams.TargetQuality = targetQuality;
+                break;
+            default: // "vbr"
+                config->RcParams.RateControlMode = NvEncParamsRcMode.Vbr;
+                config->RcParams.AverageBitRate = averageBitRate;
+                config->RcParams.MaxBitRate = 150_000_000;
+                config->RcParams.MultiPass = NvEncMultiPass.Disabled;
+                config->RcParams.TargetQuality = targetQuality;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Diagnostic-only: queries NVENC hardware capabilities and logs the results.
+    /// Called once after session open. Does not change any encoder state.
+    /// </summary>
+    private unsafe void QueryEncoderCaps()
+    {
+        // Query YUV444 encode support
+        var capsParam = new NvEncCapsParam
+        {
+            Version = LibNvEnc.NV_ENC_CAPS_PARAM_VER,
+            CapsToQuery = NvEncCaps.SupportYuv444Encode
+        };
+        int capsVal = 0;
+        var status = LibNvEnc.FunctionList.GetEncodeCaps(_encoder, NvEncCodecGuids.H264, ref capsParam, ref capsVal);
+        if (status == NvEncStatus.Success)
+            Console.WriteLine($"[ENC-DIAG] YUV444 encode support: {(capsVal != 0 ? "YES" : "NO")} (caps value={capsVal})");
+        else
+            Console.WriteLine($"[ENC-DIAG] GetEncodeCaps(SupportYuv444Encode) failed: {status}");
+
+        // Query lossless encode support (related to High 4:4:4 Predictive)
+        capsParam.CapsToQuery = NvEncCaps.SupportLosslessEncode;
+        capsVal = 0;
+        status = LibNvEnc.FunctionList.GetEncodeCaps(_encoder, NvEncCodecGuids.H264, ref capsParam, ref capsVal);
+        if (status == NvEncStatus.Success)
+            Console.WriteLine($"[ENC-DIAG] Lossless encode support: {(capsVal != 0 ? "YES" : "NO")} (caps value={capsVal})");
+
+        // Enumerate supported input buffer formats
+        uint fmtCount = 0;
+        status = LibNvEnc.FunctionList.GetInputFormatCount(_encoder, NvEncCodecGuids.H264, ref fmtCount);
+        if (status == NvEncStatus.Success && fmtCount > 0)
+        {
+            var formats = stackalloc NvEncBufferFormat[(int)fmtCount];
+            uint actualCount = 0;
+            status = LibNvEnc.FunctionList.GetInputFormats(_encoder, NvEncCodecGuids.H264, formats, fmtCount, ref actualCount);
+            if (status == NvEncStatus.Success)
+            {
+                var fmtNames = new string[(int)actualCount];
+                for (int i = 0; i < (int)actualCount; i++)
+                    fmtNames[i] = formats[i].ToString();
+                Console.WriteLine($"[ENC-DIAG] Supported input formats ({actualCount}): {string.Join(", ", fmtNames)}");
+            }
+        }
+        else
+        {
+            Console.WriteLine($"[ENC-DIAG] GetInputFormatCount failed: {status} (count={fmtCount})");
+        }
     }
 
     public void ForceKeyFrame()

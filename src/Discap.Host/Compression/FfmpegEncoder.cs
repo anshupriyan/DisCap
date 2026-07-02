@@ -169,7 +169,7 @@ public sealed class FfmpegEncoder : IVideoEncoder
     }
 
     public void ForceKeyFrame() { }
-    public void Reconfigure(int bitrate, int fps) { }
+    public void Reconfigure(int bitrate, int fps, byte targetQuality = 0) { }
 
     public void Dispose()
     {

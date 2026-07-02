@@ -90,7 +90,7 @@ class UsbReceiver(
                         h264Decoder = H264Decoder(surface, width, height)
                         h264Decoder?.start()
                     }
-                    h264Decoder?.decode(payloadBuffer, 0, compressedSize)
+                    h264Decoder?.decode(payloadBuffer, 0, compressedSize, timestampUs)
                 } else if (frameType.toInt() == 1) {
                     if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {
                         lz4Decoder = Lz4Decoder(surface, width, height)

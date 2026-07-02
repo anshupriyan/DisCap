@@ -23,7 +23,7 @@ public struct ControlPacket
     public byte ResolutionScale;
     public byte EncoderMode;
     public byte ShowStats;
-    public byte Reserved0;
+    public byte TargetQuality;
     public byte Reserved1;
     public byte Reserved2;
 
@@ -50,7 +50,7 @@ public struct ControlPacket
             ResolutionScale = buffer[6],
             EncoderMode = buffer[7],
             ShowStats = buffer[8],
-            Reserved0 = buffer[9],
+            TargetQuality = buffer[9],
             Reserved1 = buffer[10],
             Reserved2 = buffer[11]
         };

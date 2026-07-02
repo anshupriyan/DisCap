@@ -37,6 +37,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var resolutionScale = 100
     private var encoderMode = ENCODER_AUTO
     private var showStats = false
+    private var cqLevel = 28  // NVENC Target Quality (range 15-40, default 28)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -126,16 +127,41 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             setPadding(dp(12), dp(10), dp(12), dp(10))
             visibility = View.GONE
 
-            addView(label("Bitrate"))
-            bitrateValue = label("${bitrateMbps} Mbps")
+            addView(label("Target bitrate (Mbps) — actual usage scales with content, up to a high ceiling automatically"))
+            bitrateValue = label(if (bitrateMbps >= 150) "Uncapped (Max Peak)" else "${bitrateMbps} Mbps")
             addView(bitrateValue)
             addView(SeekBar(this@MainActivity).apply {
-                max = 95
+                max = 145
                 progress = bitrateMbps - 5
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                         bitrateMbps = progress + 5
-                        bitrateValue.text = "${bitrateMbps} Mbps"
+                        if (bitrateMbps >= 150) {
+                            bitrateValue.text = "Uncapped (Max Peak)"
+                        } else {
+                            bitrateValue.text = "${bitrateMbps} Mbps"
+                        }
+                        if (fromUser) sendSettings()
+                    }
+                    override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                    override fun onStopTrackingTouch(seekBar: SeekBar?) = sendSettings()
+                })
+            })
+
+            addView(label("Target Quality / Compression Level (CQ) (Lower = Better Quality, Higher = More Compression)"))
+            val cqValue = label("${cqLevel} (Default: 28)")
+            addView(cqValue)
+            addView(SeekBar(this@MainActivity).apply {
+                max = 25  // range: 15 to 40
+                progress = cqLevel - 15
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        cqLevel = progress + 15
+                        var labelText = "$cqLevel"
+                        if (cqLevel == 15) labelText += " (Best)"
+                        if (cqLevel == 28) labelText += " (Default)"
+                        if (cqLevel == 40) labelText += " (Lowest)"
+                        cqValue.text = labelText
                         if (fromUser) sendSettings()
                     }
                     override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -200,7 +226,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             fpsCap,
             resolutionScale,
             encoderMode,
-            showStats
+            showStats,
+            cqLevel
         )
     }
 
@@ -268,6 +295,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun handleVideoSizeChanged(videoWidth: Int, videoHeight: Int) {
         runOnUiThread {
             if (videoWidth == 0 || videoHeight == 0) return@runOnUiThread
+            
+            surfaceView.holder.setFixedSize(videoWidth, videoHeight)
             
             val parent = surfaceView.parent as? View ?: return@runOnUiThread
             val parentWidth = parent.width

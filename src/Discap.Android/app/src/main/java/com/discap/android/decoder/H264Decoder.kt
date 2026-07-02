@@ -6,17 +6,20 @@ import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
 
-class H264Decoder(private val surface: Surface, val width: Int, val height: Int) {
+class H264Decoder(private val surface: Surface, var width: Int, var height: Int) {
 
     private var codec: MediaCodec? = null
     private var isConfigured = false
     @Volatile private var isRunning = false
     private var outputThread: Thread? = null
+    @Volatile private var streamBaseUs: Long = -1L
 
     fun start() {
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) // Critical for zero-latency decoding
+            format.setInteger(MediaFormat.KEY_MAX_WIDTH, 3840)
+            format.setInteger(MediaFormat.KEY_MAX_HEIGHT, 2160)
             
             codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             
@@ -34,9 +37,53 @@ class H264Decoder(private val surface: Surface, val width: Int, val height: Int)
         }
     }
 
-    fun decode(nalData: ByteArray, offset: Int, length: Int) {
+    private var pendingCsdAfterFlush = false
+
+    fun flush(newWidth: Int, newHeight: Int) {
+        try {
+            codec?.flush()
+            width = newWidth
+            height = newHeight
+            pendingCsdAfterFlush = true
+            Log.i("Discap.H264", "[DEC] flushed and updated resolution to ${newWidth}x${newHeight}")
+        } catch (e: Exception) {
+            Log.e("Discap.H264", "Failed to flush MediaCodec: ${e.message}")
+        }
+    }
+
+    fun decode(nalData: ByteArray, offset: Int, length: Int, timestampUs: Long) {
         if (!isConfigured) return
         val codec = codec ?: return
+
+        if (streamBaseUs == -1L) {
+            streamBaseUs = (System.nanoTime() / 1000) - timestampUs
+        }
+
+        // Parse NAL unit type
+        var nalType = -1
+        var headerIndex = offset
+        if (length >= 4) {
+            if (nalData[offset] == 0.toByte() && nalData[offset + 1] == 0.toByte()) {
+                if (nalData[offset + 2] == 1.toByte()) {
+                    headerIndex = offset + 3
+                } else if (nalData[offset + 2] == 0.toByte() && nalData[offset + 3] == 1.toByte()) {
+                    headerIndex = offset + 4
+                }
+            }
+        }
+        if (headerIndex < offset + length) {
+            nalType = nalData[headerIndex].toInt() and 0x1F
+        }
+
+        var flags = 0
+        if (pendingCsdAfterFlush) {
+            if (nalType == 7 || nalType == 8) {
+                flags = MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+            } else if (nalType == 5) {
+                pendingCsdAfterFlush = false
+                Log.i("Discap.H264", "[DEC] CSD flush complete — IDR received, decoder reconfigured")
+            }
+        }
 
         try {
             // 1. Feed NAL unit to decoder
@@ -46,9 +93,7 @@ class H264Decoder(private val surface: Surface, val width: Int, val height: Int)
                 if (inputBuffer != null) {
                     inputBuffer.clear()
                     inputBuffer.put(nalData, offset, length)
-                    // We don't have accurate PTS here yet, just using system time for now
-                    val pts = System.nanoTime() / 1000
-                    codec.queueInputBuffer(inputBufferIndex, 0, length, pts, 0)
+                    codec.queueInputBuffer(inputBufferIndex, 0, length, timestampUs, flags)
                 }
             }
         } catch (e: Exception) {
@@ -71,7 +116,9 @@ class H264Decoder(private val surface: Surface, val width: Int, val height: Int)
                 
                 if (outputBufferIndex >= 0) {
                     val t1 = System.nanoTime()
-                    codec.releaseOutputBuffer(outputBufferIndex, true)
+                    val ptsUs = bufferInfo.presentationTimeUs
+                    val renderTimestampNs = (streamBaseUs + ptsUs) * 1000
+                    codec.releaseOutputBuffer(outputBufferIndex, renderTimestampNs)
                     
                     val dequeueMs = (t1 - t0) / 1000000.0
                     totalDequeueMs += dequeueMs

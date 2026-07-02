@@ -73,6 +73,8 @@ public sealed class DesktopDuplicator : IDisposable
     private int _width;
     private int _height;
     private readonly int _timeoutMs;
+    private int _lastSentCursorX = -1;
+    private int _lastSentCursorY = -1;
     private string _deviceName = string.Empty;
 
     /// <summary>Width of the captured output in pixels.</summary>
@@ -305,81 +307,89 @@ public sealed class DesktopDuplicator : IDisposable
                 return null;
             }
 
+            UpdatePointerShape(frameInfo);
+
+            if (frameInfo.LastMouseUpdateTime > 0)
+            {
+                _lastPointerPosition = frameInfo.PointerPosition;
+            }
+            
+            // Always force cursor to be visible, ignoring hardware visibility state as requested
+            _lastPointerPosition.Visible = true;
+
+            if (desktopResource == null)
+            {
+                return null;
+            }
+
             using (desktopResource)
             {
-                if (desktopResource == null) return null;
-
                 // Copy the GPU texture to our dedicated GPU texture for compute processing.
                 using var srcTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
                 _context.CopyResource(_gpuTexture!, srcTexture);
+            }
 
-                UpdatePointerShape(frameInfo);
+            _lastSentCursorX = _lastPointerPosition.Position.X;
+            _lastSentCursorY = _lastPointerPosition.Position.Y;
 
-                if (frameInfo.LastMouseUpdateTime > 0)
+            var nv12Target = _colorConverter!.EnsureOutputTexture(_width, _height);
+            int cursorHeight = _pointerShapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(_pointerShapeInfo.Height / 2) : (int)_pointerShapeInfo.Height;
+            
+            long t2 = Stopwatch.GetTimestamp();
+            _colorConverter.Convert(
+                _gpuSrv!, 
+                _lastPointerPosition.Position.X, 
+                _lastPointerPosition.Position.Y, 
+                (int)_pointerShapeInfo.Width, 
+                cursorHeight);
+
+            _context.CopyResource(_stagingNv12Texture!, nv12Target);
+            
+            // Copy to the plain NVENC texture (must have no bind flags and NV12 format)
+            _context.CopyResource(_nvencTexture!, nv12Target);
+            
+            // Flush the GPU context to ensure the compute shader and copy are completed
+            // before NVENC attempts to read from the texture.
+            _context.Flush();
+            
+            long t3 = Stopwatch.GetTimestamp();
+
+            // Extract dirty rects from DXGI.
+            var dirtyRects = GetDirtyRects();
+            int totalDirtyArea = 0;
+            foreach (var rect in dirtyRects)
+            {
+                totalDirtyArea += (rect.Right - rect.Left) * (rect.Bottom - rect.Top);
+            }
+
+            long tCopyStart = Stopwatch.GetTimestamp();
+            // Map the staging NV12 texture to read pixels.
+            var mapped = _context.Map(_stagingNv12Texture, 0, MapMode.Read);
+            try
+            {
+                var frame = new FrameBuffer(_width, _height, (int)mapped.RowPitch, PixelFormat.NV12);
+                frame.TimestampTicks = t0;
+                frame.CaptureTimeMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
+                frame.ConvertTimeMs = (t3 - t2) * 1000.0 / Stopwatch.Frequency;
+                frame.DirtyRects = dirtyRects;
+                frame.TotalDirtyArea = totalDirtyArea;
+                frame.GpuTexture = _nvencTexture;
+
+                // Copy NV12 pixel data from GPU mapped memory to our frame buffer.
+                unsafe
                 {
-                    _lastPointerPosition = frameInfo.PointerPosition;
-                }
-                
-                // Always force cursor to be visible, ignoring hardware visibility state as requested
-                _lastPointerPosition.Visible = true;
-
-                var nv12Target = _colorConverter!.EnsureOutputTexture(_width, _height);
-                int cursorHeight = _pointerShapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(_pointerShapeInfo.Height / 2) : (int)_pointerShapeInfo.Height;
-                
-                long t2 = Stopwatch.GetTimestamp();
-                _colorConverter.Convert(
-                    _gpuSrv!, 
-                    _lastPointerPosition.Position.X, 
-                    _lastPointerPosition.Position.Y, 
-                    (int)_pointerShapeInfo.Width, 
-                    cursorHeight);
-
-                _context.CopyResource(_stagingNv12Texture!, nv12Target);
-                
-                // Copy to the plain NVENC texture (must have no bind flags and NV12 format)
-                _context.CopyResource(_nvencTexture!, nv12Target);
-                
-                // Flush the GPU context to ensure the compute shader and copy are completed
-                // before NVENC attempts to read from the texture.
-                _context.Flush();
-                
-                long t3 = Stopwatch.GetTimestamp();
-
-                // Extract dirty rects from DXGI.
-                var dirtyRects = GetDirtyRects();
-                int totalDirtyArea = 0;
-                foreach (var rect in dirtyRects)
-                {
-                    totalDirtyArea += (rect.Right - rect.Left) * (rect.Bottom - rect.Top);
-                }
-
-                // Map the staging NV12 texture to read pixels.
-                var mapped = _context.Map(_stagingNv12Texture, 0, MapMode.Read);
-                try
-                {
-                    var frame = new FrameBuffer(_width, _height, (int)mapped.RowPitch, PixelFormat.NV12);
-                    frame.TimestampTicks = t0;
-                    frame.CaptureTimeMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
-                    frame.ConvertTimeMs = (t3 - t2) * 1000.0 / Stopwatch.Frequency;
-                    frame.DirtyRects = dirtyRects;
-                    frame.TotalDirtyArea = totalDirtyArea;
-                    frame.GpuTexture = _nvencTexture;
-
-                    // Copy NV12 pixel data from GPU mapped memory to our frame buffer.
-                    unsafe
+                    if (frame.Pixels != null)
                     {
-                        if (frame.Pixels != null)
-                        {
-                            Marshal.Copy(mapped.DataPointer, frame.Pixels, 0, frame.DataSize);
-                        }
+                        Marshal.Copy(mapped.DataPointer, frame.Pixels, 0, frame.DataSize);
                     }
+                }
 
-                    return frame;
-                }
-                finally
-                {
-                    _context.Unmap(_stagingNv12Texture, 0);
-                }
+                frame.ReadbackTimeMs = (Stopwatch.GetTimestamp() - tCopyStart) * 1000.0 / Stopwatch.Frequency;
+                return frame;
+            }
+            finally
+            {
+                _context.Unmap(_stagingNv12Texture, 0);
             }
         }
         catch (SharpGen.Runtime.SharpGenException ex) when (
@@ -509,6 +519,56 @@ public sealed class DesktopDuplicator : IDisposable
         Console.WriteLine("[CAP] Reinitializing Desktop Duplication...");
         Thread.Sleep(500); // Brief pause before retry.
         Initialize(_outputIndex);
+    }
+
+    public bool RecompositeCursorIfMoved(FrameBuffer frame)
+    {
+        if (_device == null || _context == null || _colorConverter == null || _stagingNv12Texture == null || _gpuSrv == null)
+            return false;
+
+        if (frame.Width != _width || frame.Height != _height)
+            return false;
+
+        int cursorX = _lastPointerPosition.Position.X;
+        int cursorY = _lastPointerPosition.Position.Y;
+
+        if (cursorX == _lastSentCursorX && cursorY == _lastSentCursorY)
+            return false;
+
+        _lastSentCursorX = cursorX;
+        _lastSentCursorY = cursorY;
+
+        var nv12Target = _colorConverter.EnsureOutputTexture(_width, _height);
+        int cursorHeight = _pointerShapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(_pointerShapeInfo.Height / 2) : (int)_pointerShapeInfo.Height;
+
+        _colorConverter.Convert(
+            _gpuSrv, 
+            cursorX, 
+            cursorY, 
+            (int)_pointerShapeInfo.Width, 
+            cursorHeight);
+
+        _context.CopyResource(_stagingNv12Texture, nv12Target);
+        _context.CopyResource(_nvencTexture!, nv12Target);
+        _context.Flush();
+
+        var mapped = _context.Map(_stagingNv12Texture, 0, MapMode.Read);
+        try
+        {
+            unsafe
+            {
+                if (frame.Pixels != null)
+                {
+                    Marshal.Copy(mapped.DataPointer, frame.Pixels, 0, frame.DataSize);
+                }
+            }
+        }
+        finally
+        {
+            _context.Unmap(_stagingNv12Texture, 0);
+        }
+
+        return true;
     }
 
     /// <summary>
