@@ -5,6 +5,7 @@ import android.util.Log
 import android.view.Surface
 import com.discap.android.decoder.H264Decoder
 import com.discap.android.decoder.Lz4Decoder
+import com.discap.android.overlay.CursorManager
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.FileInputStream
@@ -18,6 +19,8 @@ class UsbReceiver(
     private val onVideoSizeChanged: ((Int, Int) -> Unit)? = null,
     private val statsCallback: ((SocketReceiver.FrameStats) -> Unit)? = null
 ) {
+    var cursorManager: CursorManager? = null
+
     private var isRunning = false
     private var thread: Thread? = null
 
@@ -72,11 +75,15 @@ class UsbReceiver(
                 val compressedSize = bb.getInt()
                 val timestampUs = bb.getLong()
 
-                if (compressedSize > payloadBuffer.size) {
-                    payloadBuffer = ByteArray(compressedSize)
+                if (compressedSize < 0 || compressedSize > 10 * 1024 * 1024) {
+                    Log.e("Discap.Usb", "Invalid payload size: $compressedSize. Disconnecting.")
+                    break
                 }
 
-                input.readFully(payloadBuffer, 0, compressedSize)
+                val payload = ByteArray(compressedSize)
+                if (compressedSize > 0) {
+                    input.readFully(payload, 0, compressedSize)
+                }
 
                 if (width != lastWidth || height != lastHeight) {
                     lastWidth = width
@@ -84,18 +91,30 @@ class UsbReceiver(
                     onVideoSizeChanged?.invoke(width, height)
                 }
 
-                if (frameType.toInt() == 2) {
-                    if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
-                        h264Decoder?.release()
-                        h264Decoder = H264Decoder(surface, width, height)
-                        h264Decoder?.start()
+                when (frameType.toInt()) {
+                    2 -> {
+                        if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
+                            h264Decoder?.release()
+                            h264Decoder = H264Decoder(surface, width, height)
+                            h264Decoder?.start()
+                        }
+                        h264Decoder?.decode(payload, 0, compressedSize, timestampUs)
                     }
-                    h264Decoder?.decode(payloadBuffer, 0, compressedSize, timestampUs)
-                } else if (frameType.toInt() == 1) {
-                    if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {
-                        lz4Decoder = Lz4Decoder(surface, width, height)
+                    1 -> {
+                        if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {
+                            lz4Decoder = Lz4Decoder(surface, width, height)
+                        }
+                        lz4Decoder?.decode(payload, compressedSize, originalSize)
                     }
-                    lz4Decoder?.decode(payloadBuffer, compressedSize, originalSize)
+                    3 -> {
+                        cursorManager?.handlePositionPacket(payload, width, height)
+                    }
+                    4 -> {
+                        cursorManager?.handleShapePacket(payload)
+                    }
+                    5 -> {
+                        // Heartbeat
+                    }
                 }
 
                 if (timestampUs != lastTimestampUs) {

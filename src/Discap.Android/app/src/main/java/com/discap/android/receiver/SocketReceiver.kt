@@ -4,6 +4,7 @@ import android.util.Log
 import android.view.Surface
 import com.discap.android.decoder.H264Decoder
 import com.discap.android.decoder.Lz4Decoder
+import com.discap.android.overlay.CursorManager
 import java.io.DataInputStream
 import java.io.EOFException
 import java.net.Socket
@@ -16,6 +17,8 @@ class SocketReceiver(
     private val onVideoSizeChanged: ((Int, Int) -> Unit)? = null,
     private val statsCallback: ((FrameStats) -> Unit)? = null
 ) {
+
+    var cursorManager: CursorManager? = null
 
     private var isRunning = false
     private var thread: Thread? = null
@@ -105,13 +108,16 @@ class SocketReceiver(
                     bb.getInt() // sequence number
                     bb.getShort() // flags
 
-                    // Resize payload buffer if needed
-                    if (compressedSize > payloadBuffer.size) {
-                        payloadBuffer = ByteArray(compressedSize)
+                    if (compressedSize < 0 || compressedSize > 10 * 1024 * 1024) {
+                        Log.e("Discap.Net", "Invalid payload size: $compressedSize. Disconnecting.")
+                        break
                     }
 
-                    // Read exactly compressedSize bytes of payload
-                    input.readFully(payloadBuffer, 0, compressedSize)
+                    // Read exactly compressedSize bytes of payload into dedicated buffer
+                    val payload = ByteArray(compressedSize)
+                    if (compressedSize > 0) {
+                        input.readFully(payload, 0, compressedSize)
+                    }
                     
                     if (width != lastWidth || height != lastHeight) {
                         lastWidth = width
@@ -121,21 +127,31 @@ class SocketReceiver(
                     
                     Log.i("Discap.Net", "[RCV] Packet received: type=$frameType size=$compressedSize")
 
-                    // Route to appropriate decoder
-                    if (frameType.toInt() == 2) {
-                        // NVENC H.264
-                        if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
-                            h264Decoder?.release()
-                            h264Decoder = H264Decoder(surface, width, height)
-                            h264Decoder?.start()
+                    // Route to appropriate decoder or OOB handler
+                    when (frameType.toInt()) {
+                        2 -> { // NVENC H.264
+                            if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
+                                h264Decoder?.release()
+                                h264Decoder = H264Decoder(surface, width, height)
+                                h264Decoder?.start()
+                            }
+                            h264Decoder?.decode(payload, 0, compressedSize, timestampUs)
                         }
-                        h264Decoder?.decode(payloadBuffer, 0, compressedSize, timestampUs)
-                    } else if (frameType.toInt() == 1) {
-                        // LZ4
-                        if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {
-                            lz4Decoder = Lz4Decoder(surface, width, height)
+                        1 -> { // LZ4
+                            if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {
+                                lz4Decoder = Lz4Decoder(surface, width, height)
+                            }
+                            lz4Decoder?.decode(payload, compressedSize, originalSize)
                         }
-                        lz4Decoder?.decode(payloadBuffer, compressedSize, originalSize)
+                        3 -> { // CURSOR_POSITION
+                            cursorManager?.handlePositionPacket(payload, width, height)
+                        }
+                        4 -> { // CURSOR_SHAPE
+                            cursorManager?.handleShapePacket(payload)
+                        }
+                        5 -> { // HEARTBEAT
+                            // Connection heartbeat packet — maintains socket active state during screen idle
+                        }
                     }
 
                     if (timestampUs != lastTimestampUs) {

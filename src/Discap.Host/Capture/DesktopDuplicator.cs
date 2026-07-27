@@ -4,6 +4,7 @@ using Vortice;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using Discap.Host.Protocol;
 
 namespace Discap.Host.Capture;
 
@@ -88,6 +89,11 @@ public sealed class DesktopDuplicator : IDisposable
     private int _lastSentCursorY = -1;
     private string _deviceName = string.Empty;
 
+    public CursorPositionInfo CurrentCursorPosition { get; private set; }
+    public bool CursorPositionChanged { get; private set; }
+    public CursorShapeInfo? CurrentCursorShape { get; private set; }
+    public bool CursorShapeChanged { get; private set; }
+
     /// <summary>Width of the captured output in pixels.</summary>
     public int Width => _width;
 
@@ -113,6 +119,7 @@ public sealed class DesktopDuplicator : IDisposable
         _adapterIndex = adapterIndex;
         _timeoutMs = timeoutMs;
     }
+
 
     /// <summary>
     /// Initializes the Desktop Duplication session.
@@ -326,15 +333,30 @@ public sealed class DesktopDuplicator : IDisposable
 
             Console.WriteLine($"[CAP] AcquireNextFrame returned: AccumulatedFrames={frameInfo.AccumulatedFrames}, acquireMs={acquireMs:F2}ms");
 
+            CursorPositionChanged = false;
+            CursorShapeChanged = false;
+
             UpdatePointerShape(frameInfo);
 
-            if (frameInfo.LastMouseUpdateTime > 0)
+            if (_lastSentCursorX == -1 || _lastSentCursorY == -1 || frameInfo.LastMouseUpdateTime > 0)
             {
-                _lastPointerPosition = frameInfo.PointerPosition;
+                var newPos = frameInfo.PointerPosition;
+                if (_lastSentCursorX != newPos.Position.X || _lastSentCursorY != newPos.Position.Y || _lastSentCursorX == -1)
+                {
+                    _lastPointerPosition = newPos;
+                    _lastPointerPosition.Visible = true;
+                    _lastSentCursorX = newPos.Position.X;
+                    _lastSentCursorY = newPos.Position.Y;
+
+                    CurrentCursorPosition = new CursorPositionInfo
+                    {
+                        X = newPos.Position.X,
+                        Y = newPos.Position.Y,
+                        Visible = true
+                    };
+                    CursorPositionChanged = true;
+                }
             }
-            
-            // Always force cursor to be visible, ignoring hardware visibility state as requested
-            _lastPointerPosition.Visible = true;
 
             if (desktopResource == null)
             {
@@ -348,19 +370,10 @@ public sealed class DesktopDuplicator : IDisposable
                 _context.CopyResource(_gpuTexture!, srcTexture);
             }
 
-            _lastSentCursorX = _lastPointerPosition.Position.X;
-            _lastSentCursorY = _lastPointerPosition.Position.Y;
-
             var nv12Target = _colorConverter!.EnsureOutputTexture(_width, _height);
-            int cursorHeight = _pointerShapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(_pointerShapeInfo.Height / 2) : (int)_pointerShapeInfo.Height;
             
             long t2 = Stopwatch.GetTimestamp();
-            _colorConverter.Convert(
-                _gpuSrv!, 
-                _lastPointerPosition.Position.X, 
-                _lastPointerPosition.Position.Y, 
-                (int)_pointerShapeInfo.Width, 
-                cursorHeight);
+            _colorConverter.Convert(_gpuSrv!);
 
             _context.CopyResource(_stagingNv12Texture!, nv12Target);
             
@@ -456,11 +469,32 @@ public sealed class DesktopDuplicator : IDisposable
                 if (required > 0 && required < _pointerShapeBuffer.Length)
                     Array.Clear(_pointerShapeBuffer, (int)required, _pointerShapeBuffer.Length - (int)required);
 
-                var bitmap = CursorCompositor.ExtractCursorBitmap(shapeInfo, _pointerShapeBuffer);
-                if (bitmap != null)
+                byte[]? pixelData = null;
+                uint actualHeight = shapeInfo.Height;
+
+                if (shapeInfo.Type == (uint)PointerShapeType.Monochrome)
                 {
-                    int cursorHeight = shapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(shapeInfo.Height / 2) : (int)shapeInfo.Height;
-                    _colorConverter?.UpdateCursor((int)shapeInfo.Width, cursorHeight, bitmap);
+                    actualHeight = shapeInfo.Height / 2;
+                    pixelData = new byte[frameInfo.PointerShapeBufferSize];
+                    Array.Copy(_pointerShapeBuffer, pixelData, frameInfo.PointerShapeBufferSize);
+                }
+                else
+                {
+                    pixelData = CursorCompositor.ExtractCursorBitmap(shapeInfo, _pointerShapeBuffer);
+                }
+
+                if (pixelData != null)
+                {
+                    CurrentCursorShape = new CursorShapeInfo
+                    {
+                        ShapeType = shapeInfo.Type,
+                        Width = shapeInfo.Width,
+                        Height = actualHeight,
+                        HotspotX = shapeInfo.HotSpot.X,
+                        HotspotY = shapeInfo.HotSpot.Y,
+                        PixelData = pixelData
+                    };
+                    CursorShapeChanged = true;
                 }
             }
         }
@@ -540,56 +574,6 @@ public sealed class DesktopDuplicator : IDisposable
         Console.WriteLine("[CAP] Reinitializing Desktop Duplication...");
         Thread.Sleep(500); // Brief pause before retry.
         Initialize(_outputIndex);
-    }
-
-    public bool RecompositeCursorIfMoved(FrameBuffer frame)
-    {
-        if (_device == null || _context == null || _colorConverter == null || _stagingNv12Texture == null || _gpuSrv == null)
-            return false;
-
-        if (frame.Width != _width || frame.Height != _height)
-            return false;
-
-        int cursorX = _lastPointerPosition.Position.X;
-        int cursorY = _lastPointerPosition.Position.Y;
-
-        if (cursorX == _lastSentCursorX && cursorY == _lastSentCursorY)
-            return false;
-
-        _lastSentCursorX = cursorX;
-        _lastSentCursorY = cursorY;
-
-        var nv12Target = _colorConverter.EnsureOutputTexture(_width, _height);
-        int cursorHeight = _pointerShapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(_pointerShapeInfo.Height / 2) : (int)_pointerShapeInfo.Height;
-
-        _colorConverter.Convert(
-            _gpuSrv, 
-            cursorX, 
-            cursorY, 
-            (int)_pointerShapeInfo.Width, 
-            cursorHeight);
-
-        _context.CopyResource(_stagingNv12Texture, nv12Target);
-        _context.CopyResource(_nvencTexture!, nv12Target);
-        _context.Flush();
-
-        var mapped = _context.Map(_stagingNv12Texture, 0, MapMode.Read);
-        try
-        {
-            unsafe
-            {
-                if (frame.Pixels != null)
-                {
-                    Marshal.Copy(mapped.DataPointer, frame.Pixels, 0, frame.DataSize);
-                }
-            }
-        }
-        finally
-        {
-            _context.Unmap(_stagingNv12Texture, 0);
-        }
-
-        return true;
     }
 
     /// <summary>

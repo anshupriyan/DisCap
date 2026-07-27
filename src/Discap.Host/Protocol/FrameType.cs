@@ -16,5 +16,16 @@ public enum FrameType : byte
     /// Frame is H.264 encoded via hardware (NVENC).
     /// Used for high-motion content — lossy but smooth at high framerates.
     /// </summary>
-    NVENC = 0x02
+    NVENC = 0x02,
+
+    /// <summary>
+    /// Out-of-band cursor position update (X, Y, Visibility).
+    /// </summary>
+    CURSOR_POSITION = 0x03,
+
+    /// <summary>
+    /// Out-of-band cursor shape update (Bitmap/Mask, Dimensions, Hotspot).
+    /// </summary>
+    CURSOR_SHAPE = 0x04
 }
+

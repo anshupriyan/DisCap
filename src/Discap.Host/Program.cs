@@ -466,8 +466,7 @@ public static class Program
                 {
                     // Screen is static — feed last frame to NVENC so it emits inter frames.
                     frame = lastFrame;
-                    bool cursorMoved = duplicator.RecompositeCursorIfMoved(frame);
-                    isRepeatFrame = !cursorMoved;
+                    isRepeatFrame = true;
                     wasIdle = true;
 
                     // DWM keep-alive: force DWM frame composition every 250ms during idle
@@ -478,7 +477,7 @@ public static class Program
                         lastDwmKeepAliveMs = nowMs;
                     }
 
-                    Console.WriteLine($"[LOOP] {loopIteration}: timeout — {(cursorMoved ? "cursor moved, re-composited" : "resending last frame unchanged")}");
+                    Console.WriteLine($"[LOOP] {loopIteration}: timeout — resending last frame unchanged");
                 }
                 else
                 {
@@ -626,6 +625,21 @@ public static class Program
                         {
                             Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
                             packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
+
+                            if (duplicator.CursorPositionChanged)
+                            {
+                                var posPacket = duplicator.CurrentCursorPosition.Serialize((ushort)duplicator.Width, (ushort)duplicator.Height);
+                                clientStream!.Write(posPacket, 0, posPacket.Length);
+                                totalBytesSent += posPacket.Length;
+                            }
+
+                            if (duplicator.CursorShapeChanged && duplicator.CurrentCursorShape.HasValue)
+                            {
+                                var shapePacket = duplicator.CurrentCursorShape.Value.Serialize((ushort)duplicator.Width, (ushort)duplicator.Height);
+                                clientStream!.Write(shapePacket, 0, shapePacket.Length);
+                                totalBytesSent += shapePacket.Length;
+                            }
+
                             long tSendEnd = Stopwatch.GetTimestamp();
                             
                             double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
@@ -707,6 +721,21 @@ public static class Program
                 try
                 {
                     packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
+
+                    if (duplicator.CursorPositionChanged)
+                    {
+                        var posPacket = duplicator.CurrentCursorPosition.Serialize((ushort)duplicator.Width, (ushort)duplicator.Height);
+                        clientStream!.Write(posPacket, 0, posPacket.Length);
+                        totalBytesSent += posPacket.Length;
+                    }
+
+                    if (duplicator.CursorShapeChanged && duplicator.CurrentCursorShape.HasValue)
+                    {
+                        var shapePacket = duplicator.CurrentCursorShape.Value.Serialize((ushort)duplicator.Width, (ushort)duplicator.Height);
+                        clientStream!.Write(shapePacket, 0, shapePacket.Length);
+                        totalBytesSent += shapePacket.Length;
+                    }
+
                     long tSendEnd = Stopwatch.GetTimestamp();
                     totalBytesSent += PacketHeader.SIZE + compressedSize;
                     totalSendTicks += (tSendEnd - lz4SendStartTicks);

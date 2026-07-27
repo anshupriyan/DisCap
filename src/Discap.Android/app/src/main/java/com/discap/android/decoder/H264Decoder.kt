@@ -71,13 +71,11 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
         }
 
         var flags = 0
-        if (pendingCsdAfterFlush) {
-            if (nalType == 7 || nalType == 8) {
-                flags = MediaCodec.BUFFER_FLAG_CODEC_CONFIG
-            } else if (nalType == 5) {
-                pendingCsdAfterFlush = false
-                Log.i("Discap.H264", "[DEC] CSD flush complete — IDR received, decoder reconfigured")
-            }
+        if (nalType == 7 || nalType == 8) {
+            flags = MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+        } else if (nalType == 5) {
+            flags = MediaCodec.BUFFER_FLAG_KEY_FRAME
+            pendingCsdAfterFlush = false
         }
 
         try {
@@ -132,11 +130,10 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
                         }
                     }
 
-                    // Render the newest frame immediately (true = render now).
-                    // We avoid scheduled renderTimestampNs because it holds buffers
-                    // in the BLASTBufferQueue waiting for their presentation time,
-                    // which causes "Can't acquire next buffer" overflow on bursts.
-                    codec.releaseOutputBuffer(newestIndex, true)
+                    // Render the newest frame aligned with Android SurfaceFlinger VSync (VBlank flip)
+                    // to eliminate screen tearing while avoiding BLASTBufferQueue overflow.
+                    val renderTimeNs = System.nanoTime() + 15_000_000L
+                    codec.releaseOutputBuffer(newestIndex, renderTimeNs)
 
                     val dequeueMs = (t1 - t0) / 1000000.0
                     totalDequeueMs += dequeueMs

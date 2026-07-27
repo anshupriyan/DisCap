@@ -22,9 +22,14 @@ import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbAccessory
 import android.content.Intent
 
+import com.discap.android.overlay.CursorOverlayView
+import com.discap.android.overlay.CursorManager
+
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var surfaceView: SurfaceView
+    private lateinit var cursorOverlayView: CursorOverlayView
+    private lateinit var cursorManager: CursorManager
     private lateinit var settingsPanel: LinearLayout
     private lateinit var statsView: TextView
     private lateinit var bitrateValue: TextView
@@ -72,9 +77,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView.holder.addCallback(this)
         surfaceView.setOnTouchListener { _, event -> sendTouch(event) }
 
+        cursorOverlayView = CursorOverlayView(this)
+        cursorManager = CursorManager(cursorOverlayView)
+
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
         root.addView(surfaceView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        root.addView(cursorOverlayView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
@@ -274,6 +286,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                             "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType}"
                 }
             }
+            socketReceiver?.cursorManager = cursorManager
             socketReceiver?.start()
         }
 
@@ -318,6 +331,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
             lp.gravity = Gravity.CENTER
             surfaceView.layoutParams = lp
+            cursorOverlayView.layoutParams = lp
         }
     }
 
@@ -359,6 +373,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         statsView.visibility = if (showStats) View.VISIBLE else View.GONE
                     }
                 }
+                usbReceiver?.cursorManager = cursorManager
                 usbReceiver?.start()
             }
         } catch (e: Exception) {
