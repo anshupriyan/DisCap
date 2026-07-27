@@ -417,7 +417,6 @@ public static class Program
             var dirtyRatioHistory = new Queue<float>();
             long lastReconfigureTicks = 0;
 
-<<<<<<< Updated upstream
             // Idle resume & diagnostic metrics tracking
             long lastAcquireSuccessTicks = 0;
             double steadyAcquireMs = 0;
@@ -430,7 +429,7 @@ public static class Program
             // GPU power-state downclocking that causes AcquireNextFrame spikes.
             long lastGpuKeepAliveTicks = 0;
             long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
-=======
+
             int lastSentCursorX = -10000;
             int lastSentCursorY = -10000;
             int lastLoggedCursorX = -10000;
@@ -440,7 +439,6 @@ public static class Program
             uint cachedShapeType = 0;
             long lastGdiKeepAliveMs = 0;
             bool gdiToggleColor = false;
->>>>>>> Stashed changes
 
             // ─── Capture loop ─────────────────────────────────────────
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
