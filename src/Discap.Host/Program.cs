@@ -384,6 +384,19 @@ public static class Program
             var dirtyRatioHistory = new Queue<float>();
             long lastReconfigureTicks = 0;
 
+            // Idle resume & diagnostic metrics tracking
+            long lastAcquireSuccessTicks = 0;
+            double steadyAcquireMs = 0;
+            double steadyReadbackMs = 0;
+            double steadyEncodeMs = 0;
+            double steadyAccumulatedFrames = 0;
+            int steadySampleCount = 0;
+
+            // GPU keep-alive: throttled to every ~500ms during idle to prevent
+            // GPU power-state downclocking that causes AcquireNextFrame spikes.
+            long lastGpuKeepAliveTicks = 0;
+            long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
+
             // ─── Capture loop ─────────────────────────────────────────
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
             while (_running && isClientConnected())
@@ -427,13 +440,22 @@ public static class Program
                 Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}" );
                 FrameBuffer? frame;
                 bool isRepeatFrame;
+                bool isIdleResumeFrame = false;
+                double timeSinceLastAcquiredFrameMs = 0;
+
                 if (newFrame != null)
                 {
                     lastFrame?.Dispose();
                     lastFrame = newFrame;
                     frame = newFrame;
                     isRepeatFrame = false;
-                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured, dirtyArea={frame.TotalDirtyArea}");
+
+                    long nowTicks = Stopwatch.GetTimestamp();
+                    timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
+                    isIdleResumeFrame = lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= 200.0;
+                    lastAcquireSuccessTicks = nowTicks;
+
+                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured (AccumulatedFrames={frame.AccumulatedFrames}), dirtyArea={frame.TotalDirtyArea}, timeSinceLastFrame={timeSinceLastAcquiredFrameMs:F1}ms{(isIdleResumeFrame ? " [IDLE-RESUME]" : "")}");
                     if (wasIdle)
                     {
                         wasIdle = false;
@@ -448,6 +470,16 @@ public static class Program
                     bool cursorMoved = duplicator.RecompositeCursorIfMoved(frame);
                     isRepeatFrame = !cursorMoved;
                     wasIdle = true;
+
+                    // GPU keep-alive: periodically poke the GPU during idle to prevent
+                    // power-state downclocking. Throttled to avoid flooding the command queue.
+                    long nowKA = Stopwatch.GetTimestamp();
+                    if (nowKA - lastGpuKeepAliveTicks >= gpuKeepAliveIntervalTicks)
+                    {
+                        duplicator.GpuKeepAlive();
+                        lastGpuKeepAliveTicks = nowKA;
+                    }
+
                     Console.WriteLine($"[LOOP] {loopIteration}: timeout — {(cursorMoved ? "cursor moved, re-composited" : "resending last frame unchanged")}");
                 }
                 else
@@ -544,14 +576,21 @@ public static class Program
                         lastReconfigureTicks = currentTicks;
                     }
                     Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
+                    long encodeSubmitStartTicks = Stopwatch.GetTimestamp();
                     encoder.SubmitFrame(frame);
                     Console.WriteLine($"[ENC] {loopIteration}: SubmitFrame returned");
 
                     bool sentAny = false;
+                    double encodeSubmitToCompleteMs = 0;
                     
                     // Wait up to 100ms for at least one NAL unit to arrive, then drain the queue of all immediately available NAL units.
                     while (encoder.TryGetNextPacket(out compressedData, out compressedSize, sentAny ? 0 : 100))
                     {
+                        if (!sentAny)
+                        {
+                            long encodeCompleteTicks = Stopwatch.GetTimestamp();
+                            encodeSubmitToCompleteMs = (encodeCompleteTicks - encodeSubmitStartTicks) * 1000.0 / Stopwatch.Frequency;
+                        }
                         sentAny = true;
                         nalCounter++;
 
@@ -594,7 +633,7 @@ public static class Program
                             double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
                             double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
                             
-                            Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode: {encodeMs:F2}ms | Send: {sendMs:F2}ms");
+                            Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode(SubmitToComplete): {encodeSubmitToCompleteMs:F2}ms | Send: {sendMs:F2}ms");
 
                             totalBytesSent += PacketHeader.SIZE + compressedSize;
                             totalSendTicks += (tSendEnd - sendStartTicks);
@@ -607,7 +646,31 @@ public static class Program
                     }
 
                     if (!sentAny) droppedFrames++;
-                    else nvencFrames++;
+                    else
+                    {
+                        nvencFrames++;
+                        if (!isIdleResumeFrame && !isRepeatFrame)
+                        {
+                            steadySampleCount++;
+                            double alpha = steadySampleCount < 20 ? 1.0 / steadySampleCount : 0.05;
+                            steadyAcquireMs += (frame.AcquireTimeMs - steadyAcquireMs) * alpha;
+                            steadyReadbackMs += (frame.ReadbackTimeMs - steadyReadbackMs) * alpha;
+                            steadyEncodeMs += (encodeSubmitToCompleteMs - steadyEncodeMs) * alpha;
+                            steadyAccumulatedFrames += (frame.AccumulatedFrames - steadyAccumulatedFrames) * alpha;
+                        }
+
+                        if (isIdleResumeFrame && !isRepeatFrame)
+                        {
+                            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+                            Console.WriteLine("[IDLE-RESUME-DIAG] ════════════════════════════════════════════════════════════════");
+                            Console.WriteLine($"[IDLE-RESUME-DIAG] First frame acquired after idle gap of {timeSinceLastAcquiredFrameMs:F1}ms at {timestamp}:");
+                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • DXGI AccumulatedFrames : {frame.AccumulatedFrames} (Steady-state avg: {steadyAccumulatedFrames:F2})");
+                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • AcquireNextFrame Time  : {frame.AcquireTimeMs:F2}ms (Steady-state avg: {steadyAcquireMs:F2}ms)");
+                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • GPU Readback/Copy Time : {frame.ReadbackTimeMs:F2}ms (Steady-state avg: {steadyReadbackMs:F2}ms)");
+                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • NVENC Submit-to-Complete: {encodeSubmitToCompleteMs:F2}ms (Steady-state avg: {steadyEncodeMs:F2}ms)");
+                            Console.WriteLine("[IDLE-RESUME-DIAG] ════════════════════════════════════════════════════════════════");
+                        }
+                    }
                     
                     long encodeTicks = Stopwatch.GetTimestamp() - encodeStartTicks;
                     totalEncodeTicks += encodeTicks;

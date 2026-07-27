@@ -293,6 +293,7 @@ public sealed class DesktopDuplicator : IDisposable
             var result = _duplication.AcquireNextFrame(
                 (uint)_timeoutMs, out var frameInfo, out var desktopResource);
             long t1 = Stopwatch.GetTimestamp();
+            double acquireMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
 
             if (result.Failure)
             {
@@ -306,6 +307,8 @@ public sealed class DesktopDuplicator : IDisposable
                 Reinitialize();
                 return null;
             }
+
+            Console.WriteLine($"[CAP] AcquireNextFrame returned: AccumulatedFrames={frameInfo.AccumulatedFrames}, acquireMs={acquireMs:F2}ms");
 
             UpdatePointerShape(frameInfo);
 
@@ -370,7 +373,9 @@ public sealed class DesktopDuplicator : IDisposable
                 var frame = new FrameBuffer(_width, _height, (int)mapped.RowPitch, PixelFormat.NV12);
                 frame.TimestampTicks = t0;
                 frame.CaptureTimeMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
+                frame.AcquireTimeMs = acquireMs;
                 frame.ConvertTimeMs = (t3 - t2) * 1000.0 / Stopwatch.Frequency;
+                frame.AccumulatedFrames = (int)frameInfo.AccumulatedFrames;
                 frame.DirtyRects = dirtyRects;
                 frame.TotalDirtyArea = totalDirtyArea;
                 frame.GpuTexture = _nvencTexture;
@@ -569,6 +574,26 @@ public sealed class DesktopDuplicator : IDisposable
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Performs a trivial GPU operation to prevent the GPU from entering a deep
+    /// power-saving / clock-gated state during idle periods (no desktop changes).
+    /// Uses a 1×1 texel copy between two already-allocated textures — effectively
+    /// zero GPU workload but enough command-processor activity to keep clocks up.
+    /// Call this periodically (e.g. every 500ms–1s) on the idle path only.
+    /// </summary>
+    public void GpuKeepAlive()
+    {
+        if (_context == null || _gpuTexture == null || _stagingTexture == null)
+            return;
+
+        // Copy a single 1×1 pixel region from the GPU texture to the staging texture.
+        // This is a trivial DMA operation that keeps the GPU command processor awake
+        // without any meaningful workload or pipeline disruption.
+        var box = new Vortice.Mathematics.Box(0, 0, 0, 1, 1, 1);
+        _context.CopySubresourceRegion(_stagingTexture, 0, 0, 0, 0, _gpuTexture, 0, box);
+        _context.Flush();
     }
 
     /// <summary>

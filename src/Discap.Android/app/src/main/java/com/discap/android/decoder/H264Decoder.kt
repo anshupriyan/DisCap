@@ -12,7 +12,6 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
     private var isConfigured = false
     @Volatile private var isRunning = false
     private var outputThread: Thread? = null
-    @Volatile private var streamBaseUs: Long = -1L
 
     fun start() {
         try {
@@ -54,10 +53,6 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
     fun decode(nalData: ByteArray, offset: Int, length: Int, timestampUs: Long) {
         if (!isConfigured) return
         val codec = codec ?: return
-
-        if (streamBaseUs == -1L) {
-            streamBaseUs = (System.nanoTime() / 1000) - timestampUs
-        }
 
         // Parse NAL unit type
         var nalType = -1
@@ -104,32 +99,56 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
     private fun drainOutput() {
         val bufferInfo = MediaCodec.BufferInfo()
         var framesRendered = 0
-        var totalInputMs = 0.0
+        var framesDropped = 0
         var totalDequeueMs = 0.0
         var lastLogTime = System.currentTimeMillis()
 
         while (isRunning) {
             try {
                 val codec = codec ?: break
+
+                // Dequeue first available output buffer (10ms timeout)
                 val t0 = System.nanoTime()
-                val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 10000)
-                
+                var outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 10000)
+                val t1 = System.nanoTime()
+
                 if (outputBufferIndex >= 0) {
-                    val t1 = System.nanoTime()
-                    val ptsUs = bufferInfo.presentationTimeUs
-                    val renderTimestampNs = (streamBaseUs + ptsUs) * 1000
-                    codec.releaseOutputBuffer(outputBufferIndex, renderTimestampNs)
-                    
+                    // Got a decoded frame. Now check if more are immediately available —
+                    // if so, this frame is stale and we should skip to the newest one.
+                    // This prevents BLASTBufferQueue overflow during post-idle bursts
+                    // where multiple frames arrive faster than the surface can consume.
+                    val nextInfo = MediaCodec.BufferInfo()
+                    var newestIndex = outputBufferIndex
+
+                    while (true) {
+                        val nextIndex = codec.dequeueOutputBuffer(nextInfo, 0) // non-blocking
+                        if (nextIndex >= 0) {
+                            // A newer frame is available — drop the older one without rendering
+                            codec.releaseOutputBuffer(newestIndex, false)
+                            framesDropped++
+                            newestIndex = nextIndex
+                        } else {
+                            break
+                        }
+                    }
+
+                    // Render the newest frame immediately (true = render now).
+                    // We avoid scheduled renderTimestampNs because it holds buffers
+                    // in the BLASTBufferQueue waiting for their presentation time,
+                    // which causes "Can't acquire next buffer" overflow on bursts.
+                    codec.releaseOutputBuffer(newestIndex, true)
+
                     val dequeueMs = (t1 - t0) / 1000000.0
                     totalDequeueMs += dequeueMs
                     framesRendered++
-                    
+
                     val now = System.currentTimeMillis()
                     if (now - lastLogTime >= 1000) {
-                        Log.i("Discap.H264", "[DEC-STATS] FPS: $framesRendered | Avg dequeue: ${String.format("%.2f", totalDequeueMs/framesRendered)}ms")
+                        val avgDequeue = if (framesRendered > 0) totalDequeueMs / framesRendered else 0.0
+                        Log.i("Discap.H264", "[DEC-STATS] FPS: $framesRendered | Dropped: $framesDropped | Avg dequeue: ${String.format("%.2f", avgDequeue)}ms")
                         framesRendered = 0
+                        framesDropped = 0
                         totalDequeueMs = 0.0
-                        totalInputMs = 0.0
                         lastLogTime = now
                     }
                 } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
