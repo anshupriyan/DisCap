@@ -52,6 +52,15 @@ public sealed class DesktopDuplicator : IDisposable
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
 
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateDC(string? lpszDriver, string lpszDevice, string? lpszOutput, IntPtr lpInitData);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern bool DeleteDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern uint SetPixel(IntPtr hdc, int x, int y, uint color);
+
     private const int ENUM_CURRENT_SETTINGS = -1;
 
     private ID3D11Device? _device;
@@ -62,6 +71,8 @@ public sealed class DesktopDuplicator : IDisposable
     private ID3D11ShaderResourceView? _gpuSrv;
     private ID3D11Texture2D? _stagingNv12Texture;
     private ID3D11Texture2D? _nvencTexture;
+    private IntPtr _displayHdc = IntPtr.Zero;
+    private bool _dwmPixelState;
     private ColorConverter? _colorConverter;
     private byte[] _pointerShapeBuffer = Array.Empty<byte>();
     private OutduplPointerShapeInfo _pointerShapeInfo;
@@ -265,6 +276,11 @@ public sealed class DesktopDuplicator : IDisposable
                 MiscFlags = ResourceOptionFlags.None
             };
             _nvencTexture = _device.CreateTexture2D(nvencDesc);
+
+            if (!string.IsNullOrEmpty(_deviceName))
+            {
+                _displayHdc = CreateDC(null, _deviceName, null, IntPtr.Zero);
+            }
 
             Console.WriteLine("[CAP] Desktop Duplication initialized");
             return true;
@@ -577,23 +593,24 @@ public sealed class DesktopDuplicator : IDisposable
     }
 
     /// <summary>
-    /// Performs a trivial GPU operation to prevent the GPU from entering a deep
-    /// power-saving / clock-gated state during idle periods (no desktop changes).
-    /// Uses a 1×1 texel copy between two already-allocated textures — effectively
-    /// zero GPU workload but enough command-processor activity to keep clocks up.
-    /// Call this periodically (e.g. every 500ms–1s) on the idle path only.
+    /// Forces DWM to compose a new frame during idle periods by updating a 1x1 pixel
+    /// in the bottom-right corner of the virtual display (alternating between RGB 0,0,0 and RGB 1,1,1).
+    /// Keeps DWM frame composition and DXGI Desktop Duplication capture pipeline fully primed.
     /// </summary>
-    public void GpuKeepAlive()
+    public void DwmKeepAlive()
     {
-        if (_context == null || _gpuTexture == null || _stagingTexture == null)
-            return;
+        if (_width <= 0 || _height <= 0) return;
 
-        // Copy a single 1×1 pixel region from the GPU texture to the staging texture.
-        // This is a trivial DMA operation that keeps the GPU command processor awake
-        // without any meaningful workload or pipeline disruption.
-        var box = new Vortice.Mathematics.Box(0, 0, 0, 1, 1, 1);
-        _context.CopySubresourceRegion(_stagingTexture, 0, 0, 0, 0, _gpuTexture, 0, box);
-        _context.Flush();
+        if (_displayHdc == IntPtr.Zero && !string.IsNullOrEmpty(_deviceName))
+        {
+            _displayHdc = CreateDC(null, _deviceName, null, IntPtr.Zero);
+        }
+
+        if (_displayHdc == IntPtr.Zero) return;
+
+        _dwmPixelState = !_dwmPixelState;
+        uint color = _dwmPixelState ? 0x00010101u : 0x00000000u;
+        SetPixel(_displayHdc, _width - 1, _height - 1, color);
     }
 
     /// <summary>
@@ -634,6 +651,11 @@ public sealed class DesktopDuplicator : IDisposable
         _gpuSrv = null;
         _colorConverter?.Dispose();
         _colorConverter = null;
+        if (_displayHdc != IntPtr.Zero)
+        {
+            DeleteDC(_displayHdc);
+            _displayHdc = IntPtr.Zero;
+        }
         _context?.Dispose();
         _context = null;
         _device?.Dispose();

@@ -392,10 +392,9 @@ public static class Program
             double steadyAccumulatedFrames = 0;
             int steadySampleCount = 0;
 
-            // GPU keep-alive: throttled to every ~500ms during idle to prevent
-            // GPU power-state downclocking that causes AcquireNextFrame spikes.
-            long lastGpuKeepAliveTicks = 0;
-            long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
+            // DWM keep-alive: forces DWM frame composition every 250ms during idle
+            long lastDwmKeepAliveMs = 0;
+            const long dwmKeepAliveIntervalMs = 250; // 250ms
 
             // ─── Capture loop ─────────────────────────────────────────
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
@@ -471,13 +470,12 @@ public static class Program
                     isRepeatFrame = !cursorMoved;
                     wasIdle = true;
 
-                    // GPU keep-alive: periodically poke the GPU during idle to prevent
-                    // power-state downclocking. Throttled to avoid flooding the command queue.
-                    long nowKA = Stopwatch.GetTimestamp();
-                    if (nowKA - lastGpuKeepAliveTicks >= gpuKeepAliveIntervalTicks)
+                    // DWM keep-alive: force DWM frame composition every 250ms during idle
+                    long nowMs = Environment.TickCount64;
+                    if (nowMs - lastDwmKeepAliveMs >= dwmKeepAliveIntervalMs)
                     {
-                        duplicator.GpuKeepAlive();
-                        lastGpuKeepAliveTicks = nowKA;
+                        duplicator.DwmKeepAlive();
+                        lastDwmKeepAliveMs = nowMs;
                     }
 
                     Console.WriteLine($"[LOOP] {loopIteration}: timeout — {(cursorMoved ? "cursor moved, re-composited" : "resending last frame unchanged")}");
@@ -649,7 +647,9 @@ public static class Program
                     else
                     {
                         nvencFrames++;
-                        if (!isIdleResumeFrame && !isRepeatFrame)
+                        // Telemetry fix: ONLY record and average AcquireNextFrame durations when the call
+                        // actually succeeded and returned a new frame (newFrame != null). Exclude timeouts.
+                        if (newFrame != null && !isIdleResumeFrame)
                         {
                             steadySampleCount++;
                             double alpha = steadySampleCount < 20 ? 1.0 / steadySampleCount : 0.05;
@@ -659,7 +659,7 @@ public static class Program
                             steadyAccumulatedFrames += (frame.AccumulatedFrames - steadyAccumulatedFrames) * alpha;
                         }
 
-                        if (isIdleResumeFrame && !isRepeatFrame)
+                        if (isIdleResumeFrame)
                         {
                             string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
                             Console.WriteLine("[IDLE-RESUME-DIAG] ════════════════════════════════════════════════════════════════");
