@@ -91,11 +91,23 @@ public sealed class DesktopDuplicator : IDisposable
     
     public int CurrentRefreshRate { get; private set; }
 
+    /// <summary>The GDI device name of the captured display (e.g. \\.\DISPLAY2).</summary>
+    public string DeviceName { get; private set; } = string.Empty;
+
     /// <summary>Whether the duplicator is initialized and ready to capture.</summary>
     public bool IsInitialized => _duplication != null;
 
     /// <summary>The D3D11 device used by the duplicator. Exposed for zero-copy GPU integration.</summary>
     public ID3D11Device? Device => _device;
+
+    /// <summary>Exposes the last DXGI pointer position and visibility.</summary>
+    public OutduplPointerPosition LastPointerPosition => _lastPointerPosition;
+
+    /// <summary>Exposes the current DXGI pointer shape info.</summary>
+    public OutduplPointerShapeInfo PointerShapeInfo => _pointerShapeInfo;
+
+    /// <summary>Exposes the current raw DXGI pointer shape pixel/mask buffer.</summary>
+    public byte[] PointerShapeBuffer => _pointerShapeBuffer;
 
     public DesktopDuplicator(int adapterIndex = 0, int timeoutMs = 100)
     {
@@ -184,12 +196,13 @@ public sealed class DesktopDuplicator : IDisposable
             BoundsY = outputDesc.DesktopCoordinates.Top;
             _width = outputDesc.DesktopCoordinates.Right - outputDesc.DesktopCoordinates.Left;
             _height = outputDesc.DesktopCoordinates.Bottom - outputDesc.DesktopCoordinates.Top;
+            Console.WriteLine($"[INIT] Captured Display Bounds: X={BoundsX}, Y={BoundsY}, W={_width}, H={_height}");
             
             DEVMODE dm = new DEVMODE();
             dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
             int refreshRate = 60; // fallback
-            _deviceName = outputDesc.DeviceName;
-            if (EnumDisplaySettings(_deviceName, ENUM_CURRENT_SETTINGS, ref dm))
+            DeviceName = outputDesc.DeviceName;
+            if (EnumDisplaySettings(DeviceName, ENUM_CURRENT_SETTINGS, ref dm))
             {
                 refreshRate = dm.dmDisplayFrequency;
             }
@@ -266,6 +279,8 @@ public sealed class DesktopDuplicator : IDisposable
             };
             _nvencTexture = _device.CreateTexture2D(nvencDesc);
 
+            SetDefaultCursorShape();
+
             Console.WriteLine("[CAP] Desktop Duplication initialized");
             return true;
         }
@@ -316,9 +331,6 @@ public sealed class DesktopDuplicator : IDisposable
             {
                 _lastPointerPosition = frameInfo.PointerPosition;
             }
-            
-            // Always force cursor to be visible, ignoring hardware visibility state as requested
-            _lastPointerPosition.Visible = true;
 
             if (desktopResource == null)
             {
@@ -336,15 +348,15 @@ public sealed class DesktopDuplicator : IDisposable
             _lastSentCursorY = _lastPointerPosition.Position.Y;
 
             var nv12Target = _colorConverter!.EnsureOutputTexture(_width, _height);
-            int cursorHeight = _pointerShapeInfo.Type == (uint)PointerShapeType.Monochrome ? (int)(_pointerShapeInfo.Height / 2) : (int)_pointerShapeInfo.Height;
             
             long t2 = Stopwatch.GetTimestamp();
+            // Pass -10000, -10000, 0, 0 to bypass burning cursor onto pure video texture
             _colorConverter.Convert(
                 _gpuSrv!, 
-                _lastPointerPosition.Position.X, 
-                _lastPointerPosition.Position.Y, 
-                (int)_pointerShapeInfo.Width, 
-                cursorHeight);
+                -10000, 
+                -10000, 
+                0, 
+                0);
 
             _context.CopyResource(_stagingNv12Texture!, nv12Target);
             
@@ -601,6 +613,71 @@ public sealed class DesktopDuplicator : IDisposable
     /// reinitializing the duplication session. Call periodically (e.g.
     /// once per second) to detect midstream refresh rate changes.
     /// </summary>
+    private void SetDefaultCursorShape()
+    {
+        _pointerShapeInfo = new OutduplPointerShapeInfo
+        {
+            Type = (uint)PointerShapeType.Color,
+            Width = 32,
+            Height = 32,
+            Pitch = 32 * 4,
+            HotSpot = default
+        };
+
+        _pointerShapeBuffer = new byte[32 * 32 * 4];
+
+        string[] arrow = new string[]
+        {
+            "X...............",
+            "XX..............",
+            "XOX.............",
+            "XOOX............",
+            "XOOOX...........",
+            "XOOOOX..........",
+            "XOOOOOX.........",
+            "XOOOOOOX........",
+            "XOOOOOOOX.......",
+            "XOOOOOOOOX......",
+            "XOOOOOOOOOX.....",
+            "XOOOOOOOOOOX....",
+            "XOOOOOOOOOOOX...",
+            "XOOOOOOOOOOOOX..",
+            "XOOOOOOOOOOOOOX.",
+            "XOOOOOOOOXXXXXXX",
+            "XOOOXXOOOX......",
+            "XOOX..XOOOX.....",
+            "XOX....XOOOX....",
+            "XX......XOOOX...",
+            "X........XOOOX..",
+            "..........XOOOX.",
+            "...........XXXXX"
+        };
+
+        for (int y = 0; y < arrow.Length && y < 32; y++)
+        {
+            string row = arrow[y];
+            for (int x = 0; x < row.Length && x < 32; x++)
+            {
+                char c = row[x];
+                int offset = (y * 32 + x) * 4;
+                if (c == 'X')
+                {
+                    _pointerShapeBuffer[offset + 0] = 0;   // B
+                    _pointerShapeBuffer[offset + 1] = 0;   // G
+                    _pointerShapeBuffer[offset + 2] = 0;   // R
+                    _pointerShapeBuffer[offset + 3] = 255; // A
+                }
+                else if (c == 'O')
+                {
+                    _pointerShapeBuffer[offset + 0] = 255; // B
+                    _pointerShapeBuffer[offset + 1] = 255; // G
+                    _pointerShapeBuffer[offset + 2] = 255; // R
+                    _pointerShapeBuffer[offset + 3] = 255; // A
+                }
+            }
+        }
+    }
+
     public void RefreshCurrentRefreshRate()
     {
         if (string.IsNullOrEmpty(_deviceName)) return;

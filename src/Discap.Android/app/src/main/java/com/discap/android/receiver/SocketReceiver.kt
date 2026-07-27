@@ -13,6 +13,7 @@ import kotlin.math.max
 
 class SocketReceiver(
     private val surface: Surface,
+    private val cursorManager: com.discap.android.overlay.CursorManager? = null,
     private val onVideoSizeChanged: ((Int, Int) -> Unit)? = null,
     private val statsCallback: ((FrameStats) -> Unit)? = null
 ) {
@@ -96,7 +97,8 @@ class SocketReceiver(
                     }
 
                     val version = bb.get()
-                    val frameType = bb.get() // 1 = LZ4, 2 = NVENC
+                    val frameType = bb.get()
+                    val fTypeInt = frameType.toInt() and 0xFF
                     val width = bb.getShort().toInt()
                     val height = bb.getShort().toInt()
                     val originalSize = bb.getInt()
@@ -104,6 +106,8 @@ class SocketReceiver(
                     val timestampUs = bb.getLong()
                     bb.getInt() // sequence number
                     bb.getShort() // flags
+
+                    Log.d("Discap.Net", "[HDR] RCV type=$fTypeInt size=$compressedSize w=$width h=$height")
 
                     // Resize payload buffer if needed
                     if (compressedSize > payloadBuffer.size) {
@@ -113,9 +117,22 @@ class SocketReceiver(
                     // Read exactly compressedSize bytes of payload
                     input.readFully(payloadBuffer, 0, compressedSize)
                     
+                    if (fTypeInt == 3) {
+                        Log.d("DISCAP-CURSOR", "📥 PACKET ARRIVED: Type 3, Size=$compressedSize")
+                        val copy = payloadBuffer.copyOf(compressedSize)
+                        cursorManager?.onCursorPosReceived(copy)
+                        continue
+                    } else if (fTypeInt == 4) {
+                        Log.d("DISCAP-CURSOR", "📥 SHAPE PACKET ARRIVED! Size=$compressedSize")
+                        val copy = payloadBuffer.copyOf(compressedSize)
+                        cursorManager?.onCursorShapeReceived(copy)
+                        continue
+                    }
+
                     if (width != lastWidth || height != lastHeight) {
                         lastWidth = width
                         lastHeight = height
+                        cursorManager?.setDesktopSize(width, height)
                         onVideoSizeChanged?.invoke(width, height)
                     }
                     

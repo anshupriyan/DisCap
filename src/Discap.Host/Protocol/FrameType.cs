@@ -16,5 +16,17 @@ public enum FrameType : byte
     /// Frame is H.264 encoded via hardware (NVENC).
     /// Used for high-motion content — lossy but smooth at high framerates.
     /// </summary>
-    NVENC = 0x02
+    NVENC = 0x02,
+
+    /// <summary>
+    /// Sidecar packet containing cursor position and visibility.
+    /// Payload: int32 X, int32 Y, byte Visible.
+    /// </summary>
+    CursorPos = 0x03,
+
+    /// <summary>
+    /// Sidecar packet containing cursor shape definition and bitmask buffer.
+    /// Payload: uint32 Type, uint32 Width, uint32 Height, uint32 Pitch, int32 HotspotX, int32 HotspotY, uint32 BufferSize, byte[] ShapeBuffer.
+    /// </summary>
+    CursorShape = 0x04
 }

@@ -15,6 +15,7 @@ import kotlin.math.max
 class UsbReceiver(
     private val pfd: ParcelFileDescriptor,
     private val surface: Surface,
+    private val cursorManager: com.discap.android.overlay.CursorManager? = null,
     private val onVideoSizeChanged: ((Int, Int) -> Unit)? = null,
     private val statsCallback: ((SocketReceiver.FrameStats) -> Unit)? = null
 ) {
@@ -65,12 +66,15 @@ class UsbReceiver(
                 }
 
                 bb.get() // version
-                val frameType = bb.get() // 1 = LZ4, 2 = NVENC
+                val frameType = bb.get()
+                val fTypeInt = frameType.toInt() and 0xFF
                 val width = bb.getShort().toInt()
                 val height = bb.getShort().toInt()
                 val originalSize = bb.getInt()
                 val compressedSize = bb.getInt()
                 val timestampUs = bb.getLong()
+
+                Log.d("Discap.Usb", "[HDR] RCV type=$fTypeInt size=$compressedSize w=$width h=$height")
 
                 if (compressedSize > payloadBuffer.size) {
                     payloadBuffer = ByteArray(compressedSize)
@@ -78,9 +82,22 @@ class UsbReceiver(
 
                 input.readFully(payloadBuffer, 0, compressedSize)
 
+                if (fTypeInt == 3) {
+                    Log.d("DISCAP-CURSOR", "📥 PACKET ARRIVED: Type 3, Size=$compressedSize")
+                    val copy = payloadBuffer.copyOf(compressedSize)
+                    cursorManager?.onCursorPosReceived(copy)
+                    continue
+                } else if (fTypeInt == 4) {
+                    Log.d("DISCAP-CURSOR", "📥 SHAPE PACKET ARRIVED! Size=$compressedSize")
+                    val copy = payloadBuffer.copyOf(compressedSize)
+                    cursorManager?.onCursorShapeReceived(copy)
+                    continue
+                }
+
                 if (width != lastWidth || height != lastHeight) {
                     lastWidth = width
                     lastHeight = height
+                    cursorManager?.setDesktopSize(width, height)
                     onVideoSizeChanged?.invoke(width, height)
                 }
 

@@ -4,10 +4,16 @@ using Discap.Host.Protocol;
 namespace Discap.Host.Input;
 
 /// <summary>
-/// Injects absolute mouse events into Windows using User32.SendInput.
+/// Injects absolute mouse events into Windows using User32.SetCursorPos and SendInput.
 /// </summary>
 public static class MouseInjector
 {
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDPIAware();
+
     [DllImport("user32.dll")]
     private static extern bool SetCursorPos(int X, int Y);
 
@@ -36,7 +42,24 @@ public static class MouseInjector
     private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     private const uint MOUSEEVENTF_LEFTUP = 0x0004;
 
+    private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
     private static bool _wasMouseDown = false;
+
+    public static void EnableDpiAwareness()
+    {
+        try
+        {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        catch
+        {
+            try
+            {
+                SetProcessDPIAware();
+            }
+            catch { }
+        }
+    }
 
     public static void ProcessInput(InputPacket packet, int boundsX, int boundsY, int width, int height)
     {
@@ -44,14 +67,18 @@ public static class MouseInjector
         float xNorm = packet.X / 65535.0f;
         float yNorm = packet.Y / 65535.0f;
 
-        // 2. Map to absolute physical pixels for this specific monitor
-        int targetX = boundsX + (int)(xNorm * width);
-        int targetY = boundsY + (int)(yNorm * height);
+        // 2. Map normalized touch position to relative tablet screen coordinates (0..width, 0..height)
+        int touchX = (int)(xNorm * width);
+        int touchY = (int)(yNorm * height);
 
-        // 3. Move the cursor
-        SetCursorPos(targetX, targetY);
+        // 3. Offset to absolute Windows desktop coordinates using hardcoded Virtual Display X=1920
+        int absoluteX = 1920 + touchX;
+        int absoluteY = touchY;
 
-        // 4. Handle Clicks
+        // 4. Move mouse cursor onto the Virtual Display
+        SetCursorPos(absoluteX, absoluteY);
+
+        // 5. Handle Clicks
         bool isMouseDown = packet.Action == 1 || packet.Action == 2; // Down or Move
 
         if (isMouseDown && !_wasMouseDown)

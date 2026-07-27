@@ -2,12 +2,14 @@ package com.discap.android
 
 import android.app.Activity
 import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.SurfaceTexture
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -22,9 +24,12 @@ import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbAccessory
 import android.content.Intent
 
-class MainActivity : Activity(), SurfaceHolder.Callback {
+class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
-    private lateinit var surfaceView: SurfaceView
+    private lateinit var textureView: TextureView
+    private var activeSurface: Surface? = null
+    private lateinit var cursorOverlayView: com.discap.android.overlay.CursorOverlayView
+    private lateinit var cursorManager: com.discap.android.overlay.CursorManager
     private lateinit var settingsPanel: LinearLayout
     private lateinit var statsView: TextView
     private lateinit var bitrateValue: TextView
@@ -43,7 +48,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        
+
         val display = windowManager.defaultDisplay
         val modes = display.supportedModes
         var maxHz = 0f
@@ -68,13 +73,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
 
-        surfaceView = SurfaceView(this)
-        surfaceView.holder.addCallback(this)
-        surfaceView.setOnTouchListener { _, event -> sendTouch(event) }
+        textureView = TextureView(this)
+        textureView.surfaceTextureListener = this
+        textureView.setOnTouchListener { _, event -> sendTouch(event) }
+
+        cursorOverlayView = com.discap.android.overlay.CursorOverlayView(this).apply {
+            isClickable = false
+            isFocusable = false
+        }
+        cursorManager = com.discap.android.overlay.CursorManager(cursorOverlayView)
 
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
-        root.addView(surfaceView, FrameLayout.LayoutParams(
+        root.addView(textureView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        root.addView(cursorOverlayView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
@@ -175,8 +190,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             addView(label("Resolution scale"))
             addView(buttonRow(listOf("50%" to 50, "75%" to 75, "100%" to 100)) {
                 resolutionScale = it
-                surfaceView.scaleX = it / 100f
-                surfaceView.scaleY = it / 100f
+                textureView.scaleX = it / 100f
+                textureView.scaleY = it / 100f
             })
 
             addView(label("Encoder"))
@@ -234,8 +249,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun sendTouch(event: MotionEvent): Boolean {
         val sender = socketReceiver?.sender ?: return false
 
-        val xNorm = event.x / surfaceView.width
-        val yNorm = event.y / surfaceView.height
+        val xNorm = event.x / textureView.width
+        val yNorm = event.y / textureView.height
 
         val action = when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 1.toByte()
@@ -251,24 +266,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return true
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        val width = surfaceView.width
-        val height = surfaceView.height
-        val isNull = holder.surface == null
-        Log.i("Discap", "[SURF] Surface created: ${width}x${height}")
-        Log.i("Discap", "[SURF] Surface passed to decoder: $isNull")
+    override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+        Log.i("Discap", "[SURF] TextureView SurfaceTexture available: ${width}x${height}")
+        val surface = Surface(surfaceTexture)
+        activeSurface = surface
 
         isUsbMode = false
         if (intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
             val accessory = intent?.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
             if (accessory != null) {
-                startUsbMode(accessory)
+                startUsbMode(accessory, surface)
             }
         }
 
         if (!isUsbMode) {
             Log.i("Discap", "Starting SocketReceiver (ADB Fallback)...")
-            socketReceiver = SocketReceiver(holder.surface, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
+            socketReceiver = SocketReceiver(surface, cursorManager, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
                 runOnUiThread {
                     statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
                             "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType}"
@@ -280,25 +293,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         sendSettings()
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        // Surface is consumed directly by MediaCodec and the LZ4 canvas path.
+    override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.i("Discap", "Surface destroyed. Stopping receiver...")
+    override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+        Log.i("Discap", "SurfaceTexture destroyed. Stopping receiver...")
         socketReceiver?.stopReceiver()
         socketReceiver = null
         usbReceiver?.stop()
         usbReceiver = null
+        activeSurface?.release()
+        activeSurface = null
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
     }
 
     private fun handleVideoSizeChanged(videoWidth: Int, videoHeight: Int) {
         runOnUiThread {
             if (videoWidth == 0 || videoHeight == 0) return@runOnUiThread
             
-            surfaceView.holder.setFixedSize(videoWidth, videoHeight)
-            
-            val parent = surfaceView.parent as? View ?: return@runOnUiThread
+            val parent = textureView.parent as? View ?: return@runOnUiThread
             val parentWidth = parent.width
             val parentHeight = parent.height
             if (parentWidth == 0 || parentHeight == 0) return@runOnUiThread
@@ -306,7 +322,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val videoRatio = videoWidth.toFloat() / videoHeight.toFloat()
             val screenRatio = parentWidth.toFloat() / parentHeight.toFloat()
             
-            val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
+            val lp = textureView.layoutParams as FrameLayout.LayoutParams
             if (videoRatio > screenRatio) {
                 // Video is wider than screen -> letterbox (black bars top/bottom)
                 lp.width = parentWidth
@@ -317,7 +333,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 lp.height = parentHeight
             }
             lp.gravity = Gravity.CENTER
-            surfaceView.layoutParams = lp
+            textureView.layoutParams = lp
         }
     }
 
@@ -325,6 +341,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         super.onDestroy()
         socketReceiver?.stopReceiver()
         usbReceiver?.stop()
+        activeSurface?.release()
+        activeSurface = null
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -334,13 +352,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         setIntent(newIntent)
         if (newIntent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
             val accessory = newIntent.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
-            if (accessory != null && surfaceView.holder.surface != null && surfaceView.holder.surface.isValid) {
-                startUsbMode(accessory)
+            val surface = activeSurface
+            if (accessory != null && surface != null && surface.isValid) {
+                startUsbMode(accessory, surface)
             }
         }
     }
 
-    private fun startUsbMode(accessory: UsbAccessory) {
+    private fun startUsbMode(accessory: UsbAccessory, surface: Surface) {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         try {
             val pfd = usbManager.openAccessory(accessory)
@@ -352,7 +371,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 socketReceiver = null
 
                 usbReceiver?.stop()
-                usbReceiver = UsbReceiver(pfd, surfaceView.holder.surface, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
+                usbReceiver = UsbReceiver(pfd, surface, cursorManager, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
                     runOnUiThread {
                         statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
                                 "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType} (USB)"

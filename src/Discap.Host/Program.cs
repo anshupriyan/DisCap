@@ -26,6 +26,36 @@ namespace Discap.Host;
 /// </summary>
 public static class Program
 {
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct Win32Point
+    {
+        public int X;
+        public int Y;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out Win32Point lpPoint);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+    private static extern IntPtr CreateDC(string? lpszDriver, string lpszDevice, string? lpszOutput, IntPtr lpInitData);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern IntPtr CreateSolidBrush(uint crColor);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern bool PatBlt(IntPtr hdc, int nXLeft, int nYLeft, int nWidth, int nHeight, uint dwRop);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr hObject);
+
+    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+    private static extern bool DeleteDC(IntPtr hdc);
+
+    private const uint PATCOPY = 0x00F00021;
+
     private static volatile bool _running = true;
 
     public static async Task<int> Main(string[] args)
@@ -41,6 +71,9 @@ public static class Program
                 Open-Source Virtual Display Streamer v0.1.0
 
             """);
+
+        // Enable Per-Monitor DPI Awareness so Windows Win32 coordinate calls use physical pixels.
+        MouseInjector.EnableDpiAwareness();
 
         // Parse configuration.
         var config = DiscapConfig.FromArgs(args);
@@ -384,6 +417,7 @@ public static class Program
             var dirtyRatioHistory = new Queue<float>();
             long lastReconfigureTicks = 0;
 
+<<<<<<< Updated upstream
             // Idle resume & diagnostic metrics tracking
             long lastAcquireSuccessTicks = 0;
             double steadyAcquireMs = 0;
@@ -396,6 +430,17 @@ public static class Program
             // GPU power-state downclocking that causes AcquireNextFrame spikes.
             long lastGpuKeepAliveTicks = 0;
             long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
+=======
+            int lastSentCursorX = -10000;
+            int lastSentCursorY = -10000;
+            int lastLoggedCursorX = -10000;
+            int lastLoggedCursorY = -10000;
+            bool lastSentCursorVisible = false;
+            byte[]? cachedShapeBuffer = null;
+            uint cachedShapeType = 0;
+            long lastGdiKeepAliveMs = 0;
+            bool gdiToggleColor = false;
+>>>>>>> Stashed changes
 
             // ─── Capture loop ─────────────────────────────────────────
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
@@ -432,12 +477,134 @@ public static class Program
                         nextFrameDueTicks += minFrameTicks;
                 }
 
+                // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
+                long currentMs = Environment.TickCount64;
+                if (currentMs - lastGdiKeepAliveMs >= 250)
+                {
+                    lastGdiKeepAliveMs = currentMs;
+                    gdiToggleColor = !gdiToggleColor;
+                    uint brushColor = gdiToggleColor ? 0x00010101u : 0x00000000u; // RGB(1,1,1) vs RGB(0,0,0)
+
+                    if (!string.IsNullOrEmpty(duplicator.DeviceName))
+                    {
+                        IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
+                        if (hdc != IntPtr.Zero)
+                        {
+                            IntPtr hBrush = CreateSolidBrush(brushColor);
+                            if (hBrush != IntPtr.Zero)
+                            {
+                                IntPtr hOldBrush = SelectObject(hdc, hBrush);
+                                int bltX = Math.Max(0, duplicator.Width - 32);
+                                int bltY = Math.Max(0, duplicator.Height - 32);
+                                PatBlt(hdc, bltX, bltY, 32, 32, PATCOPY);
+                                SelectObject(hdc, hOldBrush);
+                                DeleteObject(hBrush);
+                            }
+                            DeleteDC(hdc);
+                        }
+                    }
+                }
+
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
                 // encoder pipeline keeps ticking rather than stalling indefinitely.
                 Console.WriteLine($"[LOOP] {loopIteration}: waiting for AcquireNextFrame...");
                 var newFrame = duplicator.AcquireNextFrame();
-                Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}" );
+                Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}");
+
+                // ── Send Sidecar Cursor Packets (Brute-Force GetCursorPos) ──
+                GetCursorPos(out var globalPoint);
+                int globalX = globalPoint.X;
+                int globalY = globalPoint.Y;
+                int relX = globalX - duplicator.BoundsX;
+                int relY = globalY - duplicator.BoundsY;
+
+                bool isInside = (relX >= 0 && relX < duplicator.Width && relY >= 0 && relY < duplicator.Height);
+
+                if (relX != lastSentCursorX || relY != lastSentCursorY)
+                {
+                    lastSentCursorX = relX;
+                    lastSentCursorY = relY;
+
+                    var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
+                    long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                    long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                    var posHeader = PacketHeader.Create(
+                        FrameType.CursorPos,
+                        0, 0,
+                        (uint)posPayload.Length, (uint)posPayload.Length,
+                        elapsedUs,
+                        sequenceNumber++,
+                        0);
+
+                    try
+                    {
+                        packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
+                        if (Math.Abs(relX - lastLoggedCursorX) > 10 || Math.Abs(relY - lastLoggedCursorY) > 10)
+                        {
+                            lastLoggedCursorX = relX;
+                            lastLoggedCursorY = relY;
+                            Console.WriteLine($"[CURSOR-SEND] Type 3 -> X:{relX}, Y:{relY}");
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        Console.Error.WriteLine("[STREAM] CursorPos write failed — client disconnected");
+                        break;
+                    }
+                }
+
+                var currentShapeInfo = duplicator.PointerShapeInfo;
+                var currentShapeBuffer = duplicator.PointerShapeBuffer;
+                if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
+                {
+                    int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
+                    if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
+                        actualSize = currentShapeBuffer.Length;
+                    var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
+
+                    bool shapeChanged = cachedShapeBuffer == null ||
+                                         cachedShapeType != currentShapeInfo.Type ||
+                                         !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
+
+                    if (shapeChanged)
+                    {
+                        cachedShapeBuffer = activeBuffer.ToArray();
+                        cachedShapeType = currentShapeInfo.Type;
+
+                        var shapePayload = CursorPackets.SerializeCursorShape(
+                            currentShapeInfo.Type,
+                            currentShapeInfo.Width,
+                            currentShapeInfo.Height,
+                            currentShapeInfo.Pitch,
+                            currentShapeInfo.HotSpot.X,
+                            currentShapeInfo.HotSpot.Y,
+                            activeBuffer);
+
+                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                        var shapeHeader = PacketHeader.Create(
+                            FrameType.CursorShape,
+                            (ushort)currentShapeInfo.Width,
+                            (ushort)currentShapeInfo.Height,
+                            (uint)shapePayload.Length, (uint)shapePayload.Length,
+                            elapsedUs,
+                            sequenceNumber++,
+                            0);
+
+                        try
+                        {
+                            Console.WriteLine($"[NET] SENT CURSOR SHAPE: Type={currentShapeInfo.Type}, W={currentShapeInfo.Width}, H={currentShapeInfo.Height}, PayloadSize={shapePayload.Length}");
+                            packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
+                        }
+                        catch (Exception)
+                        {
+                            Console.Error.WriteLine("[STREAM] CursorShape write failed — client disconnected");
+                            break;
+                        }
+                    }
+                }
+
                 FrameBuffer? frame;
                 bool isRepeatFrame;
                 bool isIdleResumeFrame = false;
