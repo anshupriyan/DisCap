@@ -244,7 +244,7 @@ public sealed class HardwareEncoder : IVideoEncoder
         {
             _forceKeyFrameNext = false;
             picFlags = 0x00000001u | 0x00000002u; // NV_ENC_PIC_FLAG_FORCEINTRA | NV_ENC_PIC_FLAG_FORCEIDR
-            Console.WriteLine("[IDLE-RESUME] Forcing IDR keyframe for clean decoder sync.");
+            Console.WriteLine("[IDR-FORCE] Applying NV_ENC_PIC_FORCE_IDR flag for clean post-idle sync.");
         }
 
         // Encode picture — async mode: set CompletionEvent so NVENC signals

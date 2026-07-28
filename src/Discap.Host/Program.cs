@@ -591,7 +591,7 @@ public static class Program
                     long nowTicks = Stopwatch.GetTimestamp();
                     timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
 
-                    const double IDLE_GAP_THRESHOLD_MS = 50.0;
+                    const double IDLE_GAP_THRESHOLD_MS = 500.0; // 500ms is a genuine idle pause; 50ms was too sensitive at 144fps
 
                     if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
                     {
