@@ -421,15 +421,112 @@ public static class Program
             long lastGpuKeepAliveTicks = 0;
             long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
 
-            int lastSentCursorX = -10000;
-            int lastSentCursorY = -10000;
-            byte[]? cachedShapeBuffer = null;
-            uint cachedShapeType = 0;
             long lastGdiKeepAliveMs = 0;
             long lastKeepAliveLogMs = 0;
 
-            // ─── Capture loop ─────────────────────────────────────────
+            var streamLock = new object();
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
+
+            // Spawn background task for true out-of-band cursor polling (~500Hz)
+            var cursorTask = Task.Run(() =>
+            {
+                int lastSentCursorX = -10000;
+                int lastSentCursorY = -10000;
+                byte[]? cachedShapeBuffer = null;
+                uint cachedShapeType = 0;
+
+                while (_running && isClientConnected())
+                {
+                    try
+                    {
+                        if (clientStream != null && clientStream.CanWrite)
+                        {
+                            GetCursorPos(out var globalPoint);
+                            int relX = globalPoint.X - duplicator.BoundsX;
+                            int relY = globalPoint.Y - duplicator.BoundsY;
+
+                            // Send Position Packet (Type 3)
+                            if (relX != lastSentCursorX || relY != lastSentCursorY)
+                            {
+                                lastSentCursorX = relX;
+                                lastSentCursorY = relY;
+
+                                var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
+                                long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                                long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+
+                                lock (streamLock)
+                                {
+                                    uint seq = sequenceNumber++;
+                                    var posHeader = PacketHeader.Create(
+                                        FrameType.CursorPos,
+                                        0, 0,
+                                        (uint)posPayload.Length, (uint)posPayload.Length,
+                                        elapsedUs,
+                                        seq,
+                                        0);
+                                    packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
+                                }
+                            }
+
+                            // Send Shape Packet (Type 4)
+                            var currentShapeInfo = duplicator.PointerShapeInfo;
+                            var currentShapeBuffer = duplicator.PointerShapeBuffer;
+                            if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
+                            {
+                                int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
+                                if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
+                                    actualSize = currentShapeBuffer.Length;
+                                var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
+
+                                bool shapeChanged = cachedShapeBuffer == null ||
+                                                     cachedShapeType != currentShapeInfo.Type ||
+                                                     !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
+
+                                if (shapeChanged)
+                                {
+                                    cachedShapeBuffer = activeBuffer.ToArray();
+                                    cachedShapeType = currentShapeInfo.Type;
+
+                                    var shapePayload = CursorPackets.SerializeCursorShape(
+                                        currentShapeInfo.Type,
+                                        currentShapeInfo.Width,
+                                        currentShapeInfo.Height,
+                                        currentShapeInfo.Pitch,
+                                        currentShapeInfo.HotSpot.X,
+                                        currentShapeInfo.HotSpot.Y,
+                                        activeBuffer);
+
+                                    long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                                    long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+
+                                    lock (streamLock)
+                                    {
+                                        uint seq = sequenceNumber++;
+                                        var shapeHeader = PacketHeader.Create(
+                                            FrameType.CursorShape,
+                                            (ushort)currentShapeInfo.Width,
+                                            (ushort)currentShapeInfo.Height,
+                                            (uint)shapePayload.Length, (uint)shapePayload.Length,
+                                            elapsedUs,
+                                            seq,
+                                            0);
+                                        packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore cursor stream write errors — client disconnection handled by main video loop
+                    }
+
+                    Thread.Sleep(2); // ~500Hz polling rate
+                }
+            });
+
+            // ─── Capture loop ─────────────────────────────────────────
             while (_running && isClientConnected())
             {
                 try
@@ -470,102 +567,42 @@ public static class Program
                             nextFrameDueTicks += minFrameTicks;
                     }
 
+                    // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
+                    long currentMs = Environment.TickCount64;
+                    if (currentMs - lastGdiKeepAliveMs >= 250)
+                    {
+                        lastGdiKeepAliveMs = currentMs;
+
+                        bool success = false;
+                        if (!string.IsNullOrEmpty(duplicator.DeviceName))
+                        {
+                            IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
+                            if (hdc != IntPtr.Zero)
+                            {
+                                int targetX = Math.Max(0, duplicator.Width - 4);
+                                int targetY = Math.Max(0, duplicator.Height - 4);
+                                success = BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
+                                DeleteDC(hdc);
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[KEEP-ALIVE] FAILED: Could not get HDC for {duplicator.DeviceName}");
+                            }
+                        }
+
+                        if (currentMs - lastKeepAliveLogMs >= 1000)
+                        {
+                            lastKeepAliveLogMs = currentMs;
+                            Console.WriteLine($"[KEEP-ALIVE] BitBlt executed. Success: {success}");
+                        }
+                    }
+
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
                 // encoder pipeline keeps ticking rather than stalling indefinitely.
                 Console.WriteLine($"[LOOP] {loopIteration}: waiting for AcquireNextFrame...");
                 var newFrame = duplicator.AcquireNextFrame();
                 Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}");
-
-                // ── Send Sidecar Cursor Packets (Brute-Force GetCursorPos) ──
-                GetCursorPos(out var globalPoint);
-                int globalX = globalPoint.X;
-                int globalY = globalPoint.Y;
-                int relX = globalX - duplicator.BoundsX;
-                int relY = globalY - duplicator.BoundsY;
-
-                bool isInside = (relX >= 0 && relX < duplicator.Width && relY >= 0 && relY < duplicator.Height);
-
-                if (relX != lastSentCursorX || relY != lastSentCursorY)
-                {
-                    lastSentCursorX = relX;
-                    lastSentCursorY = relY;
-
-                    var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
-                    Console.WriteLine($"[CURSOR-HEX] Sending Type 3: {BitConverter.ToString(posPayload)}");
-                    long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                    long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                    var posHeader = PacketHeader.Create(
-                        FrameType.CursorPos,
-                        0, 0,
-                        (uint)posPayload.Length, (uint)posPayload.Length,
-                        elapsedUs,
-                        sequenceNumber++,
-                        0);
-
-                    try
-                    {
-                        packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
-                        clientStream!.Flush(); // CRITICAL: Flush immediately so cursor isn't stuck behind video NAL units
-                    }
-                    catch (Exception)
-                    {
-                        Console.Error.WriteLine("[STREAM] CursorPos write failed — client disconnected");
-                        break;
-                    }
-                }
-
-                var currentShapeInfo = duplicator.PointerShapeInfo;
-                var currentShapeBuffer = duplicator.PointerShapeBuffer;
-                if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
-                {
-                    int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
-                    if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
-                        actualSize = currentShapeBuffer.Length;
-                    var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
-
-                    bool shapeChanged = cachedShapeBuffer == null ||
-                                         cachedShapeType != currentShapeInfo.Type ||
-                                         !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
-
-                    if (shapeChanged)
-                    {
-                        cachedShapeBuffer = activeBuffer.ToArray();
-                        cachedShapeType = currentShapeInfo.Type;
-
-                        var shapePayload = CursorPackets.SerializeCursorShape(
-                            currentShapeInfo.Type,
-                            currentShapeInfo.Width,
-                            currentShapeInfo.Height,
-                            currentShapeInfo.Pitch,
-                            currentShapeInfo.HotSpot.X,
-                            currentShapeInfo.HotSpot.Y,
-                            activeBuffer);
-
-                        Console.WriteLine($"[CURSOR-HEX] Sending Type 4: {BitConverter.ToString(shapePayload, 0, Math.Min(shapePayload.Length, 64))}");
-                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                        var shapeHeader = PacketHeader.Create(
-                            FrameType.CursorShape,
-                            (ushort)currentShapeInfo.Width,
-                            (ushort)currentShapeInfo.Height,
-                            (uint)shapePayload.Length, (uint)shapePayload.Length,
-                            elapsedUs,
-                            sequenceNumber++,
-                            0);
-
-                        try
-                        {
-                            packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
-                            clientStream!.Flush(); // CRITICAL: Flush immediately so cursor shape isn't stuck behind video
-                        }
-                        catch (Exception)
-                        {
-                            Console.Error.WriteLine("[STREAM] CursorShape write failed — client disconnected");
-                            break;
-                        }
-                    }
-                }
 
                 FrameBuffer? frame;
                 bool isRepeatFrame;
@@ -577,15 +614,18 @@ public static class Program
                     long nowTicks = Stopwatch.GetTimestamp();
                     timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
 
-                    const double IDLE_GAP_THRESHOLD_MS = 50.0;
+                    const double IDLE_GAP_THRESHOLD_MS = 500.0; // 500ms is a genuine idle pause; 50ms was too sensitive at 144fps
 
                     if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
                     {
-                        Console.WriteLine($"[IDR-FORCE] Wake-up stall detected (gap={timeSinceLastAcquiredFrameMs:F1}ms). Forcing IDR Keyframe.");
+                        Console.WriteLine($"[IDLE-RESUME] Discarding first post-idle frame (gap={timeSinceLastAcquiredFrameMs:F1}ms) to ensure clean capture.");
+                        lastAcquireSuccessTicks = nowTicks;
+                        newFrame.Dispose();
                         if (nvencAvailable)
                         {
                             encoder.ForceKeyFrame();
                         }
+                        continue;
                     }
 
                     lastFrame?.Dispose();
@@ -730,40 +770,44 @@ public static class Program
                             }
                         }
                         
-                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                        int originalSize = frame.Width * frame.Height * 4;
-                        ushort flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
-
-                        var header = PacketHeader.Create(
-                            frameType,
-                            (ushort)frame.Width,
-                            (ushort)frame.Height,
-                            (uint)originalSize,
-                            (uint)compressedSize,
-                            elapsedUs,
-                            sequenceNumber++,
-                            flags);
-
-                        long sendStartTicks = Stopwatch.GetTimestamp();
-                        try
+                        lock (streamLock)
                         {
-                            Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
-                            packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
-                            long tSendEnd = Stopwatch.GetTimestamp();
-                            
-                            double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
-                            double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
-                            
-                            Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode(SubmitToComplete): {encodeSubmitToCompleteMs:F2}ms | Send: {sendMs:F2}ms");
+                            long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                            long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                            int originalSize = frame.Width * frame.Height * 4;
+                            uint seq = sequenceNumber++;
+                            ushort flags = seq == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
 
-                            totalBytesSent += PacketHeader.SIZE + compressedSize;
-                            totalSendTicks += (tSendEnd - sendStartTicks);
-                        }
-                        catch (Exception)
-                        {
-                            Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
-                            break;
+                            var header = PacketHeader.Create(
+                                frameType,
+                                (ushort)frame.Width,
+                                (ushort)frame.Height,
+                                (uint)originalSize,
+                                (uint)compressedSize,
+                                elapsedUs,
+                                seq,
+                                flags);
+
+                            long sendStartTicks = Stopwatch.GetTimestamp();
+                            try
+                            {
+                                Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
+                                packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
+                                long tSendEnd = Stopwatch.GetTimestamp();
+                                
+                                double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
+                                double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
+                                
+                                Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode(SubmitToComplete): {encodeSubmitToCompleteMs:F2}ms | Send: {sendMs:F2}ms");
+
+                                totalBytesSent += PacketHeader.SIZE + compressedSize;
+                                totalSendTicks += (tSendEnd - sendStartTicks);
+                            }
+                            catch (Exception)
+                            {
+                                Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
+                                break;
+                            }
                         }
                     }
 
@@ -810,33 +854,37 @@ public static class Program
                 long lz4EncodeTicks = Stopwatch.GetTimestamp() - encodeStartTicks;
                 totalEncodeTicks += lz4EncodeTicks;
 
-                long lz4ElapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                long lz4ElapsedUs = lz4ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                int lz4OriginalSize = frame.Width * frame.Height * 4;
-                ushort lz4Flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
-
-                var lz4Header = PacketHeader.Create(
-                    frameType,
-                    (ushort)frame.Width,
-                    (ushort)frame.Height,
-                    (uint)lz4OriginalSize,
-                    (uint)compressedSize,
-                    lz4ElapsedUs,
-                    sequenceNumber++,
-                    lz4Flags);
-
-                long lz4SendStartTicks = Stopwatch.GetTimestamp();
-                try
+                lock (streamLock)
                 {
-                    packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
-                    long tSendEnd = Stopwatch.GetTimestamp();
-                    totalBytesSent += PacketHeader.SIZE + compressedSize;
-                    totalSendTicks += (tSendEnd - lz4SendStartTicks);
-                }
-                catch (Exception)
-                {
-                    Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
-                    break;
+                    long lz4ElapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                    long lz4ElapsedUs = lz4ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                    int lz4OriginalSize = frame.Width * frame.Height * 4;
+                    uint lz4Seq = sequenceNumber++;
+                    ushort lz4Flags = lz4Seq == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
+
+                    var lz4Header = PacketHeader.Create(
+                        frameType,
+                        (ushort)frame.Width,
+                        (ushort)frame.Height,
+                        (uint)lz4OriginalSize,
+                        (uint)compressedSize,
+                        lz4ElapsedUs,
+                        lz4Seq,
+                        lz4Flags);
+
+                    long lz4SendStartTicks = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
+                        long tSendEnd = Stopwatch.GetTimestamp();
+                        totalBytesSent += PacketHeader.SIZE + compressedSize;
+                        totalSendTicks += (tSendEnd - lz4SendStartTicks);
+                    }
+                    catch (Exception)
+                    {
+                        Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
+                        break;
+                    }
                 }
 
                 // FPS counter — update every second.
