@@ -618,6 +618,7 @@ public static class Program
                 {
                     // Screen is static — timeout on AcquireNextFrame.
                     // Graceful Wake-Up: Silently drop missed frame to prevent network/decoder clogging during GPU wake-up
+                    Console.WriteLine("[TIMEOUT] Skipping duplicate frame to prevent ramping tear.");
                     continue;
                 }
 
