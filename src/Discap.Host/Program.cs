@@ -470,36 +470,6 @@ public static class Program
                             nextFrameDueTicks += minFrameTicks;
                     }
 
-                    // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
-                    long currentMs = Environment.TickCount64;
-                    if (currentMs - lastGdiKeepAliveMs >= 250)
-                    {
-                        lastGdiKeepAliveMs = currentMs;
-
-                        bool success = false;
-                        if (!string.IsNullOrEmpty(duplicator.DeviceName))
-                        {
-                            IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
-                            if (hdc != IntPtr.Zero)
-                            {
-                                int targetX = Math.Max(0, duplicator.Width - 4);
-                                int targetY = Math.Max(0, duplicator.Height - 4);
-                                success = BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
-                                DeleteDC(hdc);
-                            }
-                            else
-                            {
-                                Console.WriteLine($"[KEEP-ALIVE] FAILED: Could not get HDC for {duplicator.DeviceName}");
-                            }
-                        }
-
-                        if (currentMs - lastKeepAliveLogMs >= 1000)
-                        {
-                            lastKeepAliveLogMs = currentMs;
-                            Console.WriteLine($"[KEEP-ALIVE] BitBlt executed. Success: {success}");
-                        }
-                    }
-
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
                 // encoder pipeline keeps ticking rather than stalling indefinitely.
@@ -522,6 +492,7 @@ public static class Program
                     lastSentCursorY = relY;
 
                     var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
+                    Console.WriteLine($"[CURSOR-HEX] Sending Type 3: {BitConverter.ToString(posPayload)}");
                     long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
                     long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
                     var posHeader = PacketHeader.Create(
@@ -570,6 +541,7 @@ public static class Program
                             currentShapeInfo.HotSpot.Y,
                             activeBuffer);
 
+                        Console.WriteLine($"[CURSOR-HEX] Sending Type 4: {BitConverter.ToString(shapePayload, 0, Math.Min(shapePayload.Length, 64))}");
                         long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
                         long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
                         var shapeHeader = PacketHeader.Create(
@@ -603,18 +575,15 @@ public static class Program
                     long nowTicks = Stopwatch.GetTimestamp();
                     timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
 
-                    const double IDLE_GAP_THRESHOLD_MS = 500.0; // 500ms is a genuine idle pause; 50ms was too sensitive at 144fps
+                    const double IDLE_GAP_THRESHOLD_MS = 50.0;
 
                     if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
                     {
-                        Console.WriteLine($"[IDLE-RESUME] Discarding first post-idle frame (gap={timeSinceLastAcquiredFrameMs:F1}ms) to ensure clean capture.");
-                        lastAcquireSuccessTicks = nowTicks;
-                        newFrame.Dispose();
+                        Console.WriteLine($"[IDR-FORCE] Wake-up stall detected (gap={timeSinceLastAcquiredFrameMs:F1}ms). Forcing IDR Keyframe.");
                         if (nvencAvailable)
                         {
                             encoder.ForceKeyFrame();
                         }
-                        continue;
                     }
 
                     lastFrame?.Dispose();
