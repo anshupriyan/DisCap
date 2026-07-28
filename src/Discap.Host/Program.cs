@@ -591,12 +591,17 @@ public static class Program
                     long nowTicks = Stopwatch.GetTimestamp();
                     timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
 
-                    // Smart Idle-Resume Frame Dropping: Detect GPU P-state clock ramping
-                    if (lastAcquireSuccessTicks != 0 && (timeSinceLastAcquiredFrameMs >= 50.0 || newFrame.AcquireTimeMs > 20.0))
+                    const double IDLE_GAP_THRESHOLD_MS = 50.0;
+
+                    if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
                     {
-                        Console.WriteLine($"[IDLE-RESUME] GPU ramping detected (gap={timeSinceLastAcquiredFrameMs:F1}ms, acquire={newFrame.AcquireTimeMs:F1}ms). Dropping frame to prevent tearing.");
+                        Console.WriteLine($"[IDLE-RESUME] Discarding first post-idle frame (gap={timeSinceLastAcquiredFrameMs:F1}ms) to ensure clean capture.");
                         lastAcquireSuccessTicks = nowTicks;
                         newFrame.Dispose();
+                        if (nvencAvailable)
+                        {
+                            encoder.ForceKeyFrame();
+                        }
                         continue;
                     }
 
