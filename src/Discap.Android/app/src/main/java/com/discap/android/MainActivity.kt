@@ -1,15 +1,16 @@
 package com.discap.android
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Color
-import android.graphics.PixelFormat
-import android.graphics.SurfaceTexture
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
+import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
-import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -19,14 +20,13 @@ import android.widget.SeekBar
 import android.widget.TextView
 import com.discap.android.receiver.SocketReceiver
 import com.discap.android.receiver.UsbReceiver
-import com.discap.android.decoder.H264Decoder
-import android.hardware.usb.UsbManager
-import android.hardware.usb.UsbAccessory
-import android.content.Intent
+import com.discap.android.renderer.OpenGLRenderer
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
 
-class MainActivity : Activity(), TextureView.SurfaceTextureListener {
+class MainActivity : Activity() {
 
-    private lateinit var textureView: TextureView
+    private lateinit var glSurfaceView: GLSurfaceView
     private var activeSurface: Surface? = null
     private lateinit var cursorOverlayView: com.discap.android.overlay.CursorOverlayView
     private lateinit var cursorManager: com.discap.android.overlay.CursorManager
@@ -37,7 +37,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var usbReceiver: UsbReceiver? = null
     private var isUsbMode = false
 
-    private var openGLRenderer: com.discap.android.renderer.OpenGLRenderer? = null
+    private var openGLRenderer: OpenGLRenderer? = null
     private var casSharpeningPercent = 50
     private lateinit var detectedStreamResLabel: TextView
     private lateinit var casSharpnessValueLabel: TextView
@@ -79,9 +79,42 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
 
-        textureView = TextureView(this)
-        textureView.surfaceTextureListener = this
-        textureView.setOnTouchListener { _, event -> sendTouch(event) }
+        glSurfaceView = GLSurfaceView(this).apply {
+            setEGLContextClientVersion(3)
+            val renderer = object : GLSurfaceView.Renderer {
+                private var surfaceWidth = 0
+                private var surfaceHeight = 0
+
+                override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+                    Log.i("Discap-GL", "[GL] EGL Surface created. Initializing OpenGL ES 3.0 AMD CAS Renderer...")
+                    val rendererGL = OpenGLRenderer().also { openGLRenderer = it }
+                    rendererGL.initializeGL()
+
+                    rendererGL.surfaceTexture?.setOnFrameAvailableListener {
+                        requestRender()
+                    }
+
+                    val codecSurface = rendererGL.surface ?: return
+                    activeSurface = codecSurface
+
+                    runOnUiThread {
+                        startReceiversWithSurface(codecSurface)
+                    }
+                }
+
+                override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+                    surfaceWidth = width
+                    surfaceHeight = height
+                }
+
+                override fun onDrawFrame(gl: GL10?) {
+                    openGLRenderer?.drawFrame(surfaceWidth, surfaceHeight)
+                }
+            }
+            setRenderer(renderer)
+            renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            setOnTouchListener { _, event -> sendTouch(event) }
+        }
 
         cursorOverlayView = com.discap.android.overlay.CursorOverlayView(this).apply {
             isClickable = false
@@ -91,7 +124,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
-        root.addView(textureView, FrameLayout.LayoutParams(
+        root.addView(glSurfaceView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
@@ -139,6 +172,29 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         })
 
         setContentView(root)
+    }
+
+    private fun startReceiversWithSurface(surface: Surface) {
+        isUsbMode = false
+        if (intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
+            val accessory = intent?.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
+            if (accessory != null) {
+                startUsbMode(accessory, surface)
+            }
+        }
+
+        if (!isUsbMode) {
+            Log.i("Discap", "Starting SocketReceiver (ADB Fallback)...")
+            socketReceiver = SocketReceiver(surface, cursorManager, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
+                runOnUiThread {
+                    statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
+                            "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType}"
+                }
+            }
+            socketReceiver?.start()
+        }
+
+        sendSettings()
     }
 
     private fun buildSettingsPanel(): LinearLayout {
@@ -242,8 +298,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             addView(label("Resolution scale"))
             addView(buttonRow(listOf("50%" to 50, "75%" to 75, "100%" to 100)) {
                 resolutionScale = it
-                textureView.scaleX = it / 100f
-                textureView.scaleY = it / 100f
+                glSurfaceView.scaleX = it / 100f
+                glSurfaceView.scaleY = it / 100f
             })
 
             addView(label("Encoder"))
@@ -301,8 +357,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun sendTouch(event: MotionEvent): Boolean {
         val sender = socketReceiver?.sender ?: return false
 
-        val xNorm = event.x / textureView.width
-        val yNorm = event.y / textureView.height
+        val viewW = if (glSurfaceView.width > 0) glSurfaceView.width else 1
+        val viewH = if (glSurfaceView.height > 0) glSurfaceView.height else 1
+
+        val xNorm = event.x / viewW
+        val yNorm = event.y / viewH
 
         val action = when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 1.toByte()
@@ -316,50 +375,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
         sender.sendInput(xNorm, yNorm, action, button, pressure)
         return true
-    }
-
-    override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
-        Log.i("Discap", "[SURF] TextureView SurfaceTexture available: ${width}x${height}")
-        val surface = Surface(surfaceTexture)
-        activeSurface = surface
-
-        isUsbMode = false
-        if (intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
-            val accessory = intent?.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
-            if (accessory != null) {
-                startUsbMode(accessory, surface)
-            }
-        }
-
-        if (!isUsbMode) {
-            Log.i("Discap", "Starting SocketReceiver (ADB Fallback)...")
-            socketReceiver = SocketReceiver(surface, cursorManager, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
-                runOnUiThread {
-                    statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
-                            "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType}"
-                }
-            }
-            socketReceiver?.start()
-        }
-
-        sendSettings()
-    }
-
-    override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
-    }
-
-    override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-        Log.i("Discap", "SurfaceTexture destroyed. Stopping receiver...")
-        socketReceiver?.stopReceiver()
-        socketReceiver = null
-        usbReceiver?.stop()
-        usbReceiver = null
-        activeSurface?.release()
-        activeSurface = null
-        return true
-    }
-
-    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
     }
 
     private fun handleVideoSizeChanged(videoWidth: Int, videoHeight: Int) {
@@ -377,7 +392,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             openGLRenderer?.streamWidth = videoWidth
             openGLRenderer?.streamHeight = videoHeight
             
-            val parent = textureView.parent as? View ?: return@runOnUiThread
+            val parent = glSurfaceView.parent as? View ?: return@runOnUiThread
             val parentWidth = parent.width
             val parentHeight = parent.height
             if (parentWidth == 0 || parentHeight == 0) return@runOnUiThread
@@ -385,19 +400,27 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val videoRatio = videoWidth.toFloat() / videoHeight.toFloat()
             val screenRatio = parentWidth.toFloat() / parentHeight.toFloat()
             
-            val lp = textureView.layoutParams as FrameLayout.LayoutParams
+            val lp = glSurfaceView.layoutParams as FrameLayout.LayoutParams
             if (videoRatio > screenRatio) {
-                // Video is wider than screen -> letterbox (black bars top/bottom)
                 lp.width = parentWidth
                 lp.height = (parentWidth / videoRatio).toInt()
             } else {
-                // Video is taller than screen -> pillarbox (black bars left/right)
                 lp.width = (parentHeight * videoRatio).toInt()
                 lp.height = parentHeight
             }
             lp.gravity = Gravity.CENTER
-            textureView.layoutParams = lp
+            glSurfaceView.layoutParams = lp
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        glSurfaceView.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        glSurfaceView.onPause()
     }
 
     override fun onDestroy() {
@@ -406,6 +429,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         usbReceiver?.stop()
         activeSurface?.release()
         activeSurface = null
+        openGLRenderer?.release()
+        openGLRenderer = null
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
