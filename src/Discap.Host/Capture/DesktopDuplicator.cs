@@ -378,15 +378,19 @@ public sealed class DesktopDuplicator : IDisposable
             if (_syncQuery != null)
             {
                 int spinCount = 0;
-                while (!_context.GetData(_syncQuery, out bool isCompleted) || !isCompleted)
+                const int maxSpins = 50000;
+                bool isCompleted = false;
+
+                while ((!_context.GetData(_syncQuery, out isCompleted) || !isCompleted) && spinCount < maxSpins)
                 {
                     spinCount++;
-                    if (spinCount > 1000)
-                    {
-                        Console.WriteLine($"[CAP-SYNC] Query wait timed out after {spinCount} spins, continuing...");
-                        break;
-                    }
                     Thread.SpinWait(10);
+                }
+
+                if (!isCompleted)
+                {
+                    Console.WriteLine($"[CAP-SYNC] Query timed out after {spinCount} spins. Skipping frame to prevent tear.");
+                    return null;
                 }
             }
             
