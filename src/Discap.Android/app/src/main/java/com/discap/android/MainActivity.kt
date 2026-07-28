@@ -37,6 +37,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var usbReceiver: UsbReceiver? = null
     private var isUsbMode = false
 
+    private var openGLRenderer: com.discap.android.renderer.OpenGLRenderer? = null
+    private var casSharpeningPercent = 50
+    private lateinit var detectedStreamResLabel: TextView
+    private lateinit var casSharpnessValueLabel: TextView
+    private var currentStreamW = 1920
+    private var currentStreamH = 1080
     private var bitrateMbps = 20
     private var fpsCap = 0  // 0 = Native (no cap, matches display refresh rate)
     private var resolutionScale = 100
@@ -184,8 +190,54 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 })
             })
 
+            detectedStreamResLabel = label("Stream Res: 1920x1080 -> Device Screen: ${resources.displayMetrics.widthPixels}x${resources.displayMetrics.heightPixels}")
+            addView(detectedStreamResLabel)
+
+            addView(label("AMD CAS Sharpening (Mobile GPU Post-Processing)"))
+            casSharpnessValueLabel = label("50% (Balanced CAS)")
+            addView(casSharpnessValueLabel)
+            addView(SeekBar(this@MainActivity).apply {
+                max = 100
+                progress = casSharpeningPercent
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        casSharpeningPercent = progress
+                        val percentStr = when {
+                            progress == 0 -> "0% (Off - Bilinear Soft)"
+                            progress < 40 -> "$progress% (Light CAS)"
+                            progress in 40..65 -> "$progress% (Balanced CAS)"
+                            else -> "$progress% (Ultra Sharp CAS)"
+                        }
+                        casSharpnessValueLabel.text = percentStr
+                        openGLRenderer?.sharpness = progress / 100.0f
+                    }
+                    override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                    override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                })
+            })
+
             addView(label("FPS cap (Native = matches display refresh rate)"))
             addView(buttonRow(listOf("Native" to 0, "30" to 30, "60" to 60, "120" to 120, "144" to 144)) { fpsCap = it })
+
+            addView(label("GPU Hardware Upscale Target"))
+            val screenW = resources.displayMetrics.widthPixels
+            val screenH = resources.displayMetrics.heightPixels
+            addView(buttonRow(listOf("1.0x Native" to 100, "1.15x Ultra" to 115, "Screen Native ($screenW x $screenH)" to 200)) { targetTier ->
+                when (targetTier) {
+                    100 -> {
+                        openGLRenderer?.targetViewportWidth = currentStreamW
+                        openGLRenderer?.targetViewportHeight = currentStreamH
+                    }
+                    115 -> {
+                        openGLRenderer?.targetViewportWidth = (currentStreamW * 1.15f).toInt()
+                        openGLRenderer?.targetViewportHeight = (currentStreamH * 1.15f).toInt()
+                    }
+                    200 -> {
+                        openGLRenderer?.targetViewportWidth = screenW
+                        openGLRenderer?.targetViewportHeight = screenH
+                    }
+                }
+            })
 
             addView(label("Resolution scale"))
             addView(buttonRow(listOf("50%" to 50, "75%" to 75, "100%" to 100)) {
@@ -313,6 +365,17 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun handleVideoSizeChanged(videoWidth: Int, videoHeight: Int) {
         runOnUiThread {
             if (videoWidth == 0 || videoHeight == 0) return@runOnUiThread
+            currentStreamW = videoWidth
+            currentStreamH = videoHeight
+
+            val screenW = resources.displayMetrics.widthPixels
+            val screenH = resources.displayMetrics.heightPixels
+            if (::detectedStreamResLabel.isInitialized) {
+                detectedStreamResLabel.text = "Stream Res: ${videoWidth}x${videoHeight} -> Device Screen: ${screenW}x${screenH}"
+            }
+
+            openGLRenderer?.streamWidth = videoWidth
+            openGLRenderer?.streamHeight = videoHeight
             
             val parent = textureView.parent as? View ?: return@runOnUiThread
             val parentWidth = parent.width
