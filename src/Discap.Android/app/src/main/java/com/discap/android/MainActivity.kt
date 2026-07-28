@@ -90,7 +90,7 @@ class MainActivity : Activity() {
                     val rendererGL = OpenGLRenderer().also { openGLRenderer = it }
                     rendererGL.initializeGL()
 
-                    rendererGL.surfaceTexture?.setOnFrameAvailableListener {
+                    rendererGL.onFrameAvailableListener = {
                         requestRender()
                     }
 
@@ -112,7 +112,7 @@ class MainActivity : Activity() {
                 }
             }
             setRenderer(renderer)
-            renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             setOnTouchListener { _, event -> sendTouch(event) }
         }
 

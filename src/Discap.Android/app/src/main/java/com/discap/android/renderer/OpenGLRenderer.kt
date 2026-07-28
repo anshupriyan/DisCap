@@ -117,8 +117,11 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         }
     }
 
+    var onFrameAvailableListener: (() -> Unit)? = null
+
     override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
         frameAvailable = true
+        onFrameAvailableListener?.invoke()
     }
 
     fun updateTexture() {
