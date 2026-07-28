@@ -432,66 +432,73 @@ public static class Program
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
             while (_running && isClientConnected())
             {
-                Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
-                if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
-
-                if (loopIteration % 10 == 0)
+                try
                 {
-                    duplicator.GpuKeepAlive();
-                }
+                    Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
+                    if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
 
-                int fpsCap = streamSettings.FpsCap;
-                // When Native (0), pace to the display's actual refresh rate
-                int effectivePacingFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
-                long currentLoopTicks = Stopwatch.GetTimestamp();
-                if (loopIteration > 1)
-                {
-                    totalLoopIntervalTicks += (currentLoopTicks - lastLoopTicks);
-                }
-                lastLoopTicks = currentLoopTicks;
-                long currentCaptureTicks = Stopwatch.GetTimestamp();
-
-                if (effectivePacingFps > 0 && nextFrameDueTicks != 0)
-                {
-                    if (currentCaptureTicks < nextFrameDueTicks - (Stopwatch.Frequency / 1000))
+                    if (loopIteration % 10 == 0)
                     {
-                        Thread.Sleep(1); continue;
+                        duplicator.GpuKeepAlive();
                     }
-                }
-                
-                if (effectivePacingFps > 0)
-                {
-                    long minFrameTicks = Stopwatch.Frequency / effectivePacingFps;
-                    if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
-                        nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
-                    else
-                        nextFrameDueTicks += minFrameTicks;
-                }
 
-                // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
-                long currentMs = Environment.TickCount64;
-                if (currentMs - lastGdiKeepAliveMs >= 250)
-                {
-                    lastGdiKeepAliveMs = currentMs;
-
-                    if (!string.IsNullOrEmpty(duplicator.DeviceName))
+                    int fpsCap = streamSettings.FpsCap;
+                    // When Native (0), pace to the display's actual refresh rate
+                    int effectivePacingFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
+                    long currentLoopTicks = Stopwatch.GetTimestamp();
+                    if (loopIteration > 1)
                     {
-                        IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
-                        if (hdc != IntPtr.Zero)
+                        totalLoopIntervalTicks += (currentLoopTicks - lastLoopTicks);
+                    }
+                    lastLoopTicks = currentLoopTicks;
+                    long currentCaptureTicks = Stopwatch.GetTimestamp();
+
+                    if (effectivePacingFps > 0 && nextFrameDueTicks != 0)
+                    {
+                        if (currentCaptureTicks < nextFrameDueTicks - (Stopwatch.Frequency / 1000))
                         {
-                            int targetX = Math.Max(0, duplicator.Width - 4);
-                            int targetY = Math.Max(0, duplicator.Height - 4);
-                            BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
-                            DeleteDC(hdc);
+                            Thread.Sleep(1); continue;
                         }
                     }
-
-                    if (currentMs - lastKeepAliveLogMs >= 1000)
+                    
+                    if (effectivePacingFps > 0)
                     {
-                        lastKeepAliveLogMs = currentMs;
-                        Console.WriteLine("[KEEP-ALIVE] Invisible DXGI Ping");
+                        long minFrameTicks = Stopwatch.Frequency / effectivePacingFps;
+                        if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
+                            nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
+                        else
+                            nextFrameDueTicks += minFrameTicks;
                     }
-                }
+
+                    // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
+                    long currentMs = Environment.TickCount64;
+                    if (currentMs - lastGdiKeepAliveMs >= 250)
+                    {
+                        lastGdiKeepAliveMs = currentMs;
+
+                        bool success = false;
+                        if (!string.IsNullOrEmpty(duplicator.DeviceName))
+                        {
+                            IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
+                            if (hdc != IntPtr.Zero)
+                            {
+                                int targetX = Math.Max(0, duplicator.Width - 4);
+                                int targetY = Math.Max(0, duplicator.Height - 4);
+                                success = BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
+                                DeleteDC(hdc);
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[KEEP-ALIVE] FAILED: Could not get HDC for {duplicator.DeviceName}");
+                            }
+                        }
+
+                        if (currentMs - lastKeepAliveLogMs >= 1000)
+                        {
+                            lastKeepAliveLogMs = currentMs;
+                            Console.WriteLine($"[KEEP-ALIVE] BitBlt executed. Success: {success}");
+                        }
+                    }
 
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
@@ -899,6 +906,19 @@ public static class Program
                     totalEncodeTicks = 0;
                     totalSendTicks = 0;
                     totalLoopIntervalTicks = 0;
+                }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[FATAL ERROR] Loop iteration {loopIteration} crashed: {ex.Message}");
+                    Console.WriteLine($"[FATAL ERROR] Stack Trace:\n{ex.StackTrace}");
+                    break;
+                }
+
+                if (!isClientConnected())
+                {
+                    Console.WriteLine("[NET] Client disconnected. Exiting stream loop.");
+                    break;
                 }
             }
 
