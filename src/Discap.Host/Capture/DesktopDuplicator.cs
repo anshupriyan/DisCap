@@ -61,7 +61,8 @@ public sealed class DesktopDuplicator : IDisposable
     private ID3D11Texture2D? _gpuTexture;
     private ID3D11ShaderResourceView? _gpuSrv;
     private ID3D11Texture2D? _stagingNv12Texture;
-    private ID3D11Texture2D? _nvencTexture;
+    private ID3D11Texture2D[] _nvencTextures = Array.Empty<ID3D11Texture2D>();
+    private int _nvencTextureIndex = 0;
     private ColorConverter? _colorConverter;
     private byte[] _pointerShapeBuffer = Array.Empty<byte>();
     private OutduplPointerShapeInfo _pointerShapeInfo;
@@ -277,7 +278,11 @@ public sealed class DesktopDuplicator : IDisposable
                 CPUAccessFlags = CpuAccessFlags.None,
                 MiscFlags = ResourceOptionFlags.None
             };
-            _nvencTexture = _device.CreateTexture2D(nvencDesc);
+            _nvencTextures = new ID3D11Texture2D[3];
+            for (int i = 0; i < 3; i++)
+            {
+                _nvencTextures[i] = _device.CreateTexture2D(nvencDesc);
+            }
 
             SetDefaultCursorShape();
 
@@ -360,8 +365,11 @@ public sealed class DesktopDuplicator : IDisposable
 
             _context.CopyResource(_stagingNv12Texture!, nv12Target);
             
+            var currentNvencTexture = _nvencTextures[_nvencTextureIndex % 3];
+            _nvencTextureIndex++;
+
             // Copy to the plain NVENC texture (must have no bind flags and NV12 format)
-            _context.CopyResource(_nvencTexture!, nv12Target);
+            _context.CopyResource(currentNvencTexture, nv12Target);
             
             // Flush the GPU context to ensure the compute shader and copy are completed
             // before NVENC attempts to read from the texture.
@@ -390,7 +398,7 @@ public sealed class DesktopDuplicator : IDisposable
                 frame.AccumulatedFrames = (int)frameInfo.AccumulatedFrames;
                 frame.DirtyRects = dirtyRects;
                 frame.TotalDirtyArea = totalDirtyArea;
-                frame.GpuTexture = _nvencTexture;
+                frame.GpuTexture = currentNvencTexture;
 
                 // Copy NV12 pixel data from GPU mapped memory to our frame buffer.
                 unsafe
@@ -566,7 +574,7 @@ public sealed class DesktopDuplicator : IDisposable
             cursorHeight);
 
         _context.CopyResource(_stagingNv12Texture, nv12Target);
-        _context.CopyResource(_nvencTexture!, nv12Target);
+        _context.CopyResource(_nvencTextures[(_nvencTextureIndex - 1 + 3) % 3], nv12Target);
         _context.Flush();
 
         var mapped = _context.Map(_stagingNv12Texture, 0, MapMode.Read);
@@ -703,8 +711,14 @@ public sealed class DesktopDuplicator : IDisposable
         _stagingTexture = null;
         _stagingNv12Texture?.Dispose();
         _stagingNv12Texture = null;
-        _nvencTexture?.Dispose();
-        _nvencTexture = null;
+        if (_nvencTextures != null)
+        {
+            foreach (var tex in _nvencTextures)
+            {
+                tex?.Dispose();
+            }
+            _nvencTextures = Array.Empty<ID3D11Texture2D>();
+        }
         _gpuTexture?.Dispose();
         _gpuTexture = null;
         _gpuSrv?.Dispose();

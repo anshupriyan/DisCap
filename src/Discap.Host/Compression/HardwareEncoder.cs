@@ -26,7 +26,7 @@ public sealed class HardwareEncoder : IVideoEncoder
     public bool IsAvailable => _available;
 
     private NvEncoder _encoder;
-    private NvEncRegisteredPtr _registeredTexture;
+    private readonly System.Collections.Generic.Dictionary<IntPtr, NvEncRegisteredPtr> _registeredTextures = new();
     private NvEncOutputPtr _bitstreamBuffer;
 
     /// <summary>Win32 auto-reset event handle signaled by NVENC when a frame finishes encoding.</summary>
@@ -204,14 +204,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         if (texturePtr == IntPtr.Zero) return;
 
         // Register texture if it's new
-        if (texturePtr != _lastTexturePointer)
+        if (!_registeredTextures.TryGetValue(texturePtr, out var registeredRes))
         {
-            if (_registeredTexture.Handle != IntPtr.Zero)
-            {
-                LibNvEnc.FunctionList.UnregisterResource(_encoder, _registeredTexture);
-                _registeredTexture.Handle = IntPtr.Zero;
-            }
-
             var regParams = new NvEncRegisterResource
             {
                 Version = LibNvEnc.NV_ENC_REGISTER_RESOURCE_VER,
@@ -229,15 +223,15 @@ public sealed class HardwareEncoder : IVideoEncoder
                 Console.Error.WriteLine($"[ENC] RegisterResource failed: {status}");
                 return;
             }
-            _registeredTexture = regParams.RegisteredResource;
-            _lastTexturePointer = texturePtr;
+            registeredRes = regParams.RegisteredResource;
+            _registeredTextures[texturePtr] = registeredRes;
         }
 
         // Map resource
         var mapParams = new NvEncMapInputResource
         {
             Version = LibNvEnc.NV_ENC_MAP_INPUT_RESOURCE_VER,
-            RegisteredResource = _registeredTexture
+            RegisteredResource = registeredRes
         };
         if (LibNvEnc.FunctionList.MapInputResource(_encoder, ref mapParams) != NvEncStatus.Success) return;
 
@@ -577,8 +571,12 @@ public sealed class HardwareEncoder : IVideoEncoder
 
             if (_bitstreamBuffer.Handle != IntPtr.Zero)
                 LibNvEnc.FunctionList.DestroyBitstreamBuffer(_encoder, _bitstreamBuffer);
-            if (_registeredTexture.Handle != IntPtr.Zero)
-                LibNvEnc.FunctionList.UnregisterResource(_encoder, _registeredTexture);
+            foreach (var reg in _registeredTextures.Values)
+            {
+                if (reg.Handle != IntPtr.Zero)
+                    LibNvEnc.FunctionList.UnregisterResource(_encoder, reg);
+            }
+            _registeredTextures.Clear();
                 
             LibNvEnc.FunctionList.DestroyEncoder(_encoder);
             _encoder.Handle = IntPtr.Zero;
