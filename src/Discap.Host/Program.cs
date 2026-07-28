@@ -424,6 +424,11 @@ public static class Program
             long lastGdiKeepAliveMs = 0;
             long lastKeepAliveLogMs = 0;
 
+            // Wake-Up Bitrate Ramping state
+            bool isWakingUp = false;
+            int wakeUpFramesRemaining = 0;
+            const int WAKE_UP_BITRATE_BPS = 3_000_000; // 3 Mbps warm-up bitrate
+
             var streamLock = new object();
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
 
@@ -623,7 +628,14 @@ public static class Program
                         newFrame.Dispose();
                         if (nvencAvailable)
                         {
+                            isWakingUp = true;
+                            wakeUpFramesRemaining = 15;
+                            int effectiveFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
+                            Console.WriteLine($"[WAKE-UP-RAMP] Triggered: Reconfiguring NVENC to 3Mbps warm-up bitrate for 15 frames.");
+                            encoder.Reconfigure(WAKE_UP_BITRATE_BPS, effectiveFps, (byte)streamSettings.TargetQuality);
                             encoder.ForceKeyFrame();
+                            lastSetBitrate = WAKE_UP_BITRATE_BPS;
+                            lastReconfigureTicks = Stopwatch.GetTimestamp();
                         }
                         continue;
                     }
@@ -724,18 +736,38 @@ public static class Program
                 if (frameType == FrameType.NVENC && nvencAvailable)
                 {
                     int effectiveFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
-                    int targetBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
                     byte targetQuality = (byte)streamSettings.TargetQuality;
                     long currentTicks = Stopwatch.GetTimestamp();
-                    bool canReconfigure = (lastReconfigureTicks == 0) || (currentTicks - lastReconfigureTicks >= 3 * Stopwatch.Frequency);
 
-                    if (canReconfigure && (lastSetBitrate == -1 || lastSetFps != effectiveFps || lastSetQuality != targetQuality || Math.Abs(targetBitrate - lastSetBitrate) > lastSetBitrate * 0.50))
+                    if (isWakingUp)
                     {
-                        encoder.Reconfigure(targetBitrate, effectiveFps, targetQuality);
-                        lastSetBitrate = targetBitrate;
-                        lastSetFps = effectiveFps;
-                        lastSetQuality = targetQuality;
-                        lastReconfigureTicks = currentTicks;
+                        wakeUpFramesRemaining--;
+                        Console.WriteLine($"[WAKE-UP-RAMP] Encoding frame at 3Mbps warm-up bitrate ({wakeUpFramesRemaining} frames remaining)");
+                        if (wakeUpFramesRemaining <= 0)
+                        {
+                            isWakingUp = false;
+                            int normalBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
+                            Console.WriteLine($"[WAKE-UP-RAMP] Warm-up complete. Restoring target bitrate: {normalBitrate / 1_000_000}Mbps.");
+                            encoder.Reconfigure(normalBitrate, effectiveFps, targetQuality);
+                            lastSetBitrate = normalBitrate;
+                            lastSetFps = effectiveFps;
+                            lastSetQuality = targetQuality;
+                            lastReconfigureTicks = currentTicks;
+                        }
+                    }
+                    else
+                    {
+                        int targetBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
+                        bool canReconfigure = (lastReconfigureTicks == 0) || (currentTicks - lastReconfigureTicks >= 3 * Stopwatch.Frequency);
+
+                        if (canReconfigure && (lastSetBitrate == -1 || lastSetFps != effectiveFps || lastSetQuality != targetQuality || Math.Abs(targetBitrate - lastSetBitrate) > lastSetBitrate * 0.50))
+                        {
+                            encoder.Reconfigure(targetBitrate, effectiveFps, targetQuality);
+                            lastSetBitrate = targetBitrate;
+                            lastSetFps = effectiveFps;
+                            lastSetQuality = targetQuality;
+                            lastReconfigureTicks = currentTicks;
+                        }
                     }
                     Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
                     long encodeSubmitStartTicks = Stopwatch.GetTimestamp();
