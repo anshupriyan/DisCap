@@ -588,17 +588,25 @@ public static class Program
 
                 if (newFrame != null)
                 {
+                    long nowTicks = Stopwatch.GetTimestamp();
+                    timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
+
+                    // Smart Idle-Resume Frame Dropping: Detect GPU P-state clock ramping
+                    if (lastAcquireSuccessTicks != 0 && (timeSinceLastAcquiredFrameMs >= 50.0 || newFrame.AcquireTimeMs > 20.0))
+                    {
+                        Console.WriteLine($"[IDLE-RESUME] GPU ramping detected (gap={timeSinceLastAcquiredFrameMs:F1}ms, acquire={newFrame.AcquireTimeMs:F1}ms). Dropping frame to prevent tearing.");
+                        lastAcquireSuccessTicks = nowTicks;
+                        newFrame.Dispose();
+                        continue;
+                    }
+
                     lastFrame?.Dispose();
                     lastFrame = newFrame;
                     frame = newFrame;
                     isRepeatFrame = false;
-
-                    long nowTicks = Stopwatch.GetTimestamp();
-                    timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
-                    isIdleResumeFrame = lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= 200.0;
                     lastAcquireSuccessTicks = nowTicks;
 
-                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured (AccumulatedFrames={frame.AccumulatedFrames}), dirtyArea={frame.TotalDirtyArea}, timeSinceLastFrame={timeSinceLastAcquiredFrameMs:F1}ms{(isIdleResumeFrame ? " [IDLE-RESUME]" : "")}");
+                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured (AccumulatedFrames={frame.AccumulatedFrames}), dirtyArea={frame.TotalDirtyArea}, timeSinceLastFrame={timeSinceLastAcquiredFrameMs:F1}ms");
                     if (wasIdle)
                     {
                         wasIdle = false;
