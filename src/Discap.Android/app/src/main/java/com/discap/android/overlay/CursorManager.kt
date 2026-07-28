@@ -172,21 +172,4 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         }
         return true
     }
-
-    private fun createFallbackBitmap(): Bitmap {
-        val size = 32
-        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-        // Black outer circle
-        paint.color = Color.BLACK
-        canvas.drawCircle(size / 2f, size / 2f, 14f, paint)
-
-        // White inner circle
-        paint.color = Color.WHITE
-        canvas.drawCircle(size / 2f, size / 2f, 10f, paint)
-
-        return bitmap
-    }
 }
