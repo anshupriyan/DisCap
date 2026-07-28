@@ -130,6 +130,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
         initParams.EncodeConfig->GopLength = 120;
         initParams.EncodeConfig->FrameIntervalP = 1; // B-frames = 0
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.RepeatSPSPPS = true;
 
         status = LibNvEnc.FunctionList.InitializeEncoder(_encoder, ref initParams);
         if (status != NvEncStatus.Success)
@@ -460,6 +462,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
         initParams.EncodeConfig->GopLength = 120;
         initParams.EncodeConfig->FrameIntervalP = 1;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.RepeatSPSPPS = true;
 
         var reconfigParams = new NvEncReconfigureParams
         {
