@@ -506,6 +506,7 @@ public static class Program
                     try
                     {
                         packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
+                        clientStream!.Flush(); // CRITICAL: Flush immediately so cursor isn't stuck behind video NAL units
                     }
                     catch (Exception)
                     {
@@ -556,6 +557,7 @@ public static class Program
                         try
                         {
                             packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
+                            clientStream!.Flush(); // CRITICAL: Flush immediately so cursor shape isn't stuck behind video
                         }
                         catch (Exception)
                         {

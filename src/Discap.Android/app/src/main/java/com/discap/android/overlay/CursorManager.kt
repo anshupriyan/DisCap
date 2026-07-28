@@ -26,6 +26,7 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         val x = bb.int
         val y = bb.int
         val visible = bb.get().toInt() != 0
+        Log.d("DISCAP-CURSOR", "🧠 PARSED: X=$x, Y=$y, Visible=$visible")
 
         mainHandler.post {
             overlayView.updatePosition(x, y, visible)
