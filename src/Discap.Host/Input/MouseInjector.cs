@@ -67,13 +67,9 @@ public static class MouseInjector
         float xNorm = packet.X / 65535.0f;
         float yNorm = packet.Y / 65535.0f;
 
-        // 2. Map normalized touch position to relative tablet screen coordinates (0..width, 0..height)
-        int touchX = (int)(xNorm * width);
-        int touchY = (int)(yNorm * height);
-
-        // 3. Offset to absolute Windows desktop coordinates using hardcoded Virtual Display X=1920
-        int absoluteX = 1920 + touchX;
-        int absoluteY = touchY;
+        // 2. Map normalized touch position directly to local virtual display bounds
+        int absoluteX = boundsX + (int)(xNorm * width);
+        int absoluteY = boundsY + (int)(yNorm * height);
 
         // 4. Move mouse cursor onto the Virtual Display
         SetCursorPos(absoluteX, absoluteY);

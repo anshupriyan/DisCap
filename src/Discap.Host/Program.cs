@@ -40,21 +40,12 @@ public static class Program
     private static extern IntPtr CreateDC(string? lpszDriver, string lpszDevice, string? lpszOutput, IntPtr lpInitData);
 
     [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern IntPtr CreateSolidBrush(uint crColor);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern bool PatBlt(IntPtr hdc, int nXLeft, int nYLeft, int nWidth, int nHeight, uint dwRop);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern bool DeleteObject(IntPtr hObject);
+    private static extern bool BitBlt(IntPtr hdc, int nXDest, int nYDest, int nWidth, int nHeight, IntPtr hdcSrc, int nXSrc, int nYSrc, uint dwRop);
 
     [System.Runtime.InteropServices.DllImport("gdi32.dll")]
     private static extern bool DeleteDC(IntPtr hdc);
 
-    private const uint PATCOPY = 0x00F00021;
+    private const uint SRCCOPY = 0x00CC0020;
 
     private static volatile bool _running = true;
 
@@ -430,78 +421,186 @@ public static class Program
             long lastGpuKeepAliveTicks = 0;
             long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
 
-            int lastSentCursorX = -10000;
-            int lastSentCursorY = -10000;
-            int lastLoggedCursorX = -10000;
-            int lastLoggedCursorY = -10000;
-            bool lastSentCursorVisible = false;
-            byte[]? cachedShapeBuffer = null;
-            uint cachedShapeType = 0;
             long lastGdiKeepAliveMs = 0;
-            bool gdiToggleColor = false;
+            long lastKeepAliveLogMs = 0;
 
-            // ─── Capture loop ─────────────────────────────────────────
+            // Wake-Up Bitrate Ramping state
+            bool isWakingUp = false;
+            int wakeUpFramesRemaining = 0;
+            const int WAKE_UP_BITRATE_BPS = 3_000_000; // 3 Mbps warm-up bitrate
+
+            var streamLock = new object();
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
-            while (_running && isClientConnected())
+
+            // Spawn background task for true out-of-band cursor polling (~500Hz)
+            var cursorTask = Task.Run(() =>
             {
-                Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
-                if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
+                int lastSentCursorX = -10000;
+                int lastSentCursorY = -10000;
+                byte[]? cachedShapeBuffer = null;
+                uint cachedShapeType = 0;
 
-                int fpsCap = streamSettings.FpsCap;
-                // When Native (0), pace to the display's actual refresh rate
-                int effectivePacingFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
-                long currentLoopTicks = Stopwatch.GetTimestamp();
-                if (loopIteration > 1)
+                while (_running && isClientConnected())
                 {
-                    totalLoopIntervalTicks += (currentLoopTicks - lastLoopTicks);
-                }
-                lastLoopTicks = currentLoopTicks;
-                long currentCaptureTicks = Stopwatch.GetTimestamp();
-
-                if (effectivePacingFps > 0 && nextFrameDueTicks != 0)
-                {
-                    if (currentCaptureTicks < nextFrameDueTicks - (Stopwatch.Frequency / 1000))
+                    try
                     {
-                        Thread.Sleep(1); continue;
-                    }
-                }
-                
-                if (effectivePacingFps > 0)
-                {
-                    long minFrameTicks = Stopwatch.Frequency / effectivePacingFps;
-                    if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
-                        nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
-                    else
-                        nextFrameDueTicks += minFrameTicks;
-                }
-
-                // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
-                long currentMs = Environment.TickCount64;
-                if (currentMs - lastGdiKeepAliveMs >= 250)
-                {
-                    lastGdiKeepAliveMs = currentMs;
-                    gdiToggleColor = !gdiToggleColor;
-                    uint brushColor = gdiToggleColor ? 0x00010101u : 0x00000000u; // RGB(1,1,1) vs RGB(0,0,0)
-
-                    if (!string.IsNullOrEmpty(duplicator.DeviceName))
-                    {
-                        IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
-                        if (hdc != IntPtr.Zero)
+                        if (clientStream != null && clientStream.CanWrite)
                         {
-                            IntPtr hBrush = CreateSolidBrush(brushColor);
-                            if (hBrush != IntPtr.Zero)
+                            GetCursorPos(out var globalPoint);
+                            int relX = globalPoint.X - duplicator.BoundsX;
+                            int relY = globalPoint.Y - duplicator.BoundsY;
+
+                            // Send Position Packet (Type 3)
+                            if (relX != lastSentCursorX || relY != lastSentCursorY)
                             {
-                                IntPtr hOldBrush = SelectObject(hdc, hBrush);
-                                int bltX = Math.Max(0, duplicator.Width - 32);
-                                int bltY = Math.Max(0, duplicator.Height - 32);
-                                PatBlt(hdc, bltX, bltY, 32, 32, PATCOPY);
-                                SelectObject(hdc, hOldBrush);
-                                DeleteObject(hBrush);
+                                lastSentCursorX = relX;
+                                lastSentCursorY = relY;
+
+                                var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
+                                long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                                long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+
+                                lock (streamLock)
+                                {
+                                    uint seq = sequenceNumber++;
+                                    var posHeader = PacketHeader.Create(
+                                        FrameType.CursorPos,
+                                        0, 0,
+                                        (uint)posPayload.Length, (uint)posPayload.Length,
+                                        elapsedUs,
+                                        seq,
+                                        0);
+                                    packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
+                                }
                             }
-                            DeleteDC(hdc);
+
+                            // Send Shape Packet (Type 4)
+                            var currentShapeInfo = duplicator.PointerShapeInfo;
+                            var currentShapeBuffer = duplicator.PointerShapeBuffer;
+                            if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
+                            {
+                                int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
+                                if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
+                                    actualSize = currentShapeBuffer.Length;
+                                var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
+
+                                bool shapeChanged = cachedShapeBuffer == null ||
+                                                     cachedShapeType != currentShapeInfo.Type ||
+                                                     !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
+
+                                if (shapeChanged)
+                                {
+                                    cachedShapeBuffer = activeBuffer.ToArray();
+                                    cachedShapeType = currentShapeInfo.Type;
+
+                                    var shapePayload = CursorPackets.SerializeCursorShape(
+                                        currentShapeInfo.Type,
+                                        currentShapeInfo.Width,
+                                        currentShapeInfo.Height,
+                                        currentShapeInfo.Pitch,
+                                        currentShapeInfo.HotSpot.X,
+                                        currentShapeInfo.HotSpot.Y,
+                                        activeBuffer);
+
+                                    long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                                    long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+
+                                    lock (streamLock)
+                                    {
+                                        uint seq = sequenceNumber++;
+                                        var shapeHeader = PacketHeader.Create(
+                                            FrameType.CursorShape,
+                                            (ushort)currentShapeInfo.Width,
+                                            (ushort)currentShapeInfo.Height,
+                                            (uint)shapePayload.Length, (uint)shapePayload.Length,
+                                            elapsedUs,
+                                            seq,
+                                            0);
+                                        packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
+                                    }
+                                }
+                            }
                         }
                     }
+                    catch
+                    {
+                        // Ignore cursor stream write errors — client disconnection handled by main video loop
+                    }
+
+                    Thread.Sleep(2); // ~500Hz polling rate
                 }
+            });
+
+            // ─── Capture loop ─────────────────────────────────────────
+            while (_running && isClientConnected())
+            {
+                try
+                {
+                    Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
+                    if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
+
+                    if (loopIteration % 10 == 0)
+                    {
+                        duplicator.GpuKeepAlive();
+                    }
+
+                    int fpsCap = streamSettings.FpsCap;
+                    // When Native (0), pace to the display's actual refresh rate
+                    int effectivePacingFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
+                    long currentLoopTicks = Stopwatch.GetTimestamp();
+                    if (loopIteration > 1)
+                    {
+                        totalLoopIntervalTicks += (currentLoopTicks - lastLoopTicks);
+                    }
+                    lastLoopTicks = currentLoopTicks;
+                    long currentCaptureTicks = Stopwatch.GetTimestamp();
+
+                    if (effectivePacingFps > 0 && nextFrameDueTicks != 0)
+                    {
+                        if (currentCaptureTicks < nextFrameDueTicks - (Stopwatch.Frequency / 1000))
+                        {
+                            Thread.Sleep(1); continue;
+                        }
+                    }
+                    
+                    if (effectivePacingFps > 0)
+                    {
+                        long minFrameTicks = Stopwatch.Frequency / effectivePacingFps;
+                        if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
+                            nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
+                        else
+                            nextFrameDueTicks += minFrameTicks;
+                    }
+
+                    // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
+                    long currentMs = Environment.TickCount64;
+                    if (currentMs - lastGdiKeepAliveMs >= 250)
+                    {
+                        lastGdiKeepAliveMs = currentMs;
+
+                        bool success = false;
+                        if (!string.IsNullOrEmpty(duplicator.DeviceName))
+                        {
+                            IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
+                            if (hdc != IntPtr.Zero)
+                            {
+                                int targetX = Math.Max(0, duplicator.Width - 4);
+                                int targetY = Math.Max(0, duplicator.Height - 4);
+                                success = BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
+                                DeleteDC(hdc);
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[KEEP-ALIVE] FAILED: Could not get HDC for {duplicator.DeviceName}");
+                            }
+                        }
+
+                        if (currentMs - lastKeepAliveLogMs >= 1000)
+                        {
+                            lastKeepAliveLogMs = currentMs;
+                            Console.WriteLine($"[KEEP-ALIVE] BitBlt executed. Success: {success}");
+                        }
+                    }
 
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
@@ -510,99 +609,6 @@ public static class Program
                 var newFrame = duplicator.AcquireNextFrame();
                 Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}");
 
-                // ── Send Sidecar Cursor Packets (Brute-Force GetCursorPos) ──
-                GetCursorPos(out var globalPoint);
-                int globalX = globalPoint.X;
-                int globalY = globalPoint.Y;
-                int relX = globalX - duplicator.BoundsX;
-                int relY = globalY - duplicator.BoundsY;
-
-                bool isInside = (relX >= 0 && relX < duplicator.Width && relY >= 0 && relY < duplicator.Height);
-
-                if (relX != lastSentCursorX || relY != lastSentCursorY)
-                {
-                    lastSentCursorX = relX;
-                    lastSentCursorY = relY;
-
-                    var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
-                    long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                    long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                    var posHeader = PacketHeader.Create(
-                        FrameType.CursorPos,
-                        0, 0,
-                        (uint)posPayload.Length, (uint)posPayload.Length,
-                        elapsedUs,
-                        sequenceNumber++,
-                        0);
-
-                    try
-                    {
-                        packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
-                        if (Math.Abs(relX - lastLoggedCursorX) > 10 || Math.Abs(relY - lastLoggedCursorY) > 10)
-                        {
-                            lastLoggedCursorX = relX;
-                            lastLoggedCursorY = relY;
-                            Console.WriteLine($"[CURSOR-SEND] Type 3 -> X:{relX}, Y:{relY}");
-                        }
-                    }
-                    catch (Exception)
-                    {
-                        Console.Error.WriteLine("[STREAM] CursorPos write failed — client disconnected");
-                        break;
-                    }
-                }
-
-                var currentShapeInfo = duplicator.PointerShapeInfo;
-                var currentShapeBuffer = duplicator.PointerShapeBuffer;
-                if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
-                {
-                    int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
-                    if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
-                        actualSize = currentShapeBuffer.Length;
-                    var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
-
-                    bool shapeChanged = cachedShapeBuffer == null ||
-                                         cachedShapeType != currentShapeInfo.Type ||
-                                         !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
-
-                    if (shapeChanged)
-                    {
-                        cachedShapeBuffer = activeBuffer.ToArray();
-                        cachedShapeType = currentShapeInfo.Type;
-
-                        var shapePayload = CursorPackets.SerializeCursorShape(
-                            currentShapeInfo.Type,
-                            currentShapeInfo.Width,
-                            currentShapeInfo.Height,
-                            currentShapeInfo.Pitch,
-                            currentShapeInfo.HotSpot.X,
-                            currentShapeInfo.HotSpot.Y,
-                            activeBuffer);
-
-                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                        var shapeHeader = PacketHeader.Create(
-                            FrameType.CursorShape,
-                            (ushort)currentShapeInfo.Width,
-                            (ushort)currentShapeInfo.Height,
-                            (uint)shapePayload.Length, (uint)shapePayload.Length,
-                            elapsedUs,
-                            sequenceNumber++,
-                            0);
-
-                        try
-                        {
-                            Console.WriteLine($"[NET] SENT CURSOR SHAPE: Type={currentShapeInfo.Type}, W={currentShapeInfo.Width}, H={currentShapeInfo.Height}, PayloadSize={shapePayload.Length}");
-                            packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
-                        }
-                        catch (Exception)
-                        {
-                            Console.Error.WriteLine("[STREAM] CursorShape write failed — client disconnected");
-                            break;
-                        }
-                    }
-                }
-
                 FrameBuffer? frame;
                 bool isRepeatFrame;
                 bool isIdleResumeFrame = false;
@@ -610,17 +616,37 @@ public static class Program
 
                 if (newFrame != null)
                 {
+                    long nowTicks = Stopwatch.GetTimestamp();
+                    timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
+
+                    const double IDLE_GAP_THRESHOLD_MS = 500.0; // 500ms is a genuine idle pause; 50ms was too sensitive at 144fps
+
+                    if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
+                    {
+                        Console.WriteLine($"[IDLE-RESUME] Discarding first post-idle frame (gap={timeSinceLastAcquiredFrameMs:F1}ms) to ensure clean capture.");
+                        lastAcquireSuccessTicks = nowTicks;
+                        newFrame.Dispose();
+                        if (nvencAvailable)
+                        {
+                            isWakingUp = true;
+                            wakeUpFramesRemaining = 15;
+                            int effectiveFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
+                            Console.WriteLine($"[WAKE-UP-RAMP] Triggered: Reconfiguring NVENC to 3Mbps warm-up bitrate for 15 frames.");
+                            encoder.Reconfigure(WAKE_UP_BITRATE_BPS, effectiveFps, (byte)streamSettings.TargetQuality);
+                            encoder.ForceKeyFrame();
+                            lastSetBitrate = WAKE_UP_BITRATE_BPS;
+                            lastReconfigureTicks = Stopwatch.GetTimestamp();
+                        }
+                        continue;
+                    }
+
                     lastFrame?.Dispose();
                     lastFrame = newFrame;
                     frame = newFrame;
                     isRepeatFrame = false;
-
-                    long nowTicks = Stopwatch.GetTimestamp();
-                    timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
-                    isIdleResumeFrame = lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= 200.0;
                     lastAcquireSuccessTicks = nowTicks;
 
-                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured (AccumulatedFrames={frame.AccumulatedFrames}), dirtyArea={frame.TotalDirtyArea}, timeSinceLastFrame={timeSinceLastAcquiredFrameMs:F1}ms{(isIdleResumeFrame ? " [IDLE-RESUME]" : "")}");
+                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured (AccumulatedFrames={frame.AccumulatedFrames}), dirtyArea={frame.TotalDirtyArea}, timeSinceLastFrame={timeSinceLastAcquiredFrameMs:F1}ms");
                     if (wasIdle)
                     {
                         wasIdle = false;
@@ -628,28 +654,11 @@ public static class Program
                         postIdleFrameCount = 0;
                     }
                 }
-                else if (lastFrame != null && nvencAvailable && !config.ForceLz4Only)
-                {
-                    // Screen is static — feed last frame to NVENC so it emits inter frames.
-                    frame = lastFrame;
-                    bool cursorMoved = duplicator.RecompositeCursorIfMoved(frame);
-                    isRepeatFrame = !cursorMoved;
-                    wasIdle = true;
-
-                    // GPU keep-alive: periodically poke the GPU during idle to prevent
-                    // power-state downclocking. Throttled to avoid flooding the command queue.
-                    long nowKA = Stopwatch.GetTimestamp();
-                    if (nowKA - lastGpuKeepAliveTicks >= gpuKeepAliveIntervalTicks)
-                    {
-                        duplicator.GpuKeepAlive();
-                        lastGpuKeepAliveTicks = nowKA;
-                    }
-
-                    Console.WriteLine($"[LOOP] {loopIteration}: timeout — {(cursorMoved ? "cursor moved, re-composited" : "resending last frame unchanged")}");
-                }
                 else
                 {
-                    Console.WriteLine($"[LOOP] {loopIteration}: timeout, no previous frame — skipping");
+                    // Screen is static — timeout on AcquireNextFrame.
+                    // Graceful Wake-Up: Silently drop missed frame to prevent network/decoder clogging during GPU wake-up
+                    Console.WriteLine("[TIMEOUT] Skipping duplicate frame to prevent ramping tear.");
                     continue;
                 }
 
@@ -727,18 +736,38 @@ public static class Program
                 if (frameType == FrameType.NVENC && nvencAvailable)
                 {
                     int effectiveFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
-                    int targetBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
                     byte targetQuality = (byte)streamSettings.TargetQuality;
                     long currentTicks = Stopwatch.GetTimestamp();
-                    bool canReconfigure = (lastReconfigureTicks == 0) || (currentTicks - lastReconfigureTicks >= 3 * Stopwatch.Frequency);
 
-                    if (canReconfigure && (lastSetBitrate == -1 || lastSetFps != effectiveFps || lastSetQuality != targetQuality || Math.Abs(targetBitrate - lastSetBitrate) > lastSetBitrate * 0.50))
+                    if (isWakingUp)
                     {
-                        encoder.Reconfigure(targetBitrate, effectiveFps, targetQuality);
-                        lastSetBitrate = targetBitrate;
-                        lastSetFps = effectiveFps;
-                        lastSetQuality = targetQuality;
-                        lastReconfigureTicks = currentTicks;
+                        wakeUpFramesRemaining--;
+                        Console.WriteLine($"[WAKE-UP-RAMP] Encoding frame at 3Mbps warm-up bitrate ({wakeUpFramesRemaining} frames remaining)");
+                        if (wakeUpFramesRemaining <= 0)
+                        {
+                            isWakingUp = false;
+                            int normalBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
+                            Console.WriteLine($"[WAKE-UP-RAMP] Warm-up complete. Restoring target bitrate: {normalBitrate / 1_000_000}Mbps.");
+                            encoder.Reconfigure(normalBitrate, effectiveFps, targetQuality);
+                            lastSetBitrate = normalBitrate;
+                            lastSetFps = effectiveFps;
+                            lastSetQuality = targetQuality;
+                            lastReconfigureTicks = currentTicks;
+                        }
+                    }
+                    else
+                    {
+                        int targetBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
+                        bool canReconfigure = (lastReconfigureTicks == 0) || (currentTicks - lastReconfigureTicks >= 3 * Stopwatch.Frequency);
+
+                        if (canReconfigure && (lastSetBitrate == -1 || lastSetFps != effectiveFps || lastSetQuality != targetQuality || Math.Abs(targetBitrate - lastSetBitrate) > lastSetBitrate * 0.50))
+                        {
+                            encoder.Reconfigure(targetBitrate, effectiveFps, targetQuality);
+                            lastSetBitrate = targetBitrate;
+                            lastSetFps = effectiveFps;
+                            lastSetQuality = targetQuality;
+                            lastReconfigureTicks = currentTicks;
+                        }
                     }
                     Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
                     long encodeSubmitStartTicks = Stopwatch.GetTimestamp();
@@ -773,40 +802,44 @@ public static class Program
                             }
                         }
                         
-                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                        int originalSize = frame.Width * frame.Height * 4;
-                        ushort flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
-
-                        var header = PacketHeader.Create(
-                            frameType,
-                            (ushort)frame.Width,
-                            (ushort)frame.Height,
-                            (uint)originalSize,
-                            (uint)compressedSize,
-                            elapsedUs,
-                            sequenceNumber++,
-                            flags);
-
-                        long sendStartTicks = Stopwatch.GetTimestamp();
-                        try
+                        lock (streamLock)
                         {
-                            Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
-                            packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
-                            long tSendEnd = Stopwatch.GetTimestamp();
-                            
-                            double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
-                            double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
-                            
-                            Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode(SubmitToComplete): {encodeSubmitToCompleteMs:F2}ms | Send: {sendMs:F2}ms");
+                            long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                            long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                            int originalSize = frame.Width * frame.Height * 4;
+                            uint seq = sequenceNumber++;
+                            ushort flags = seq == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
 
-                            totalBytesSent += PacketHeader.SIZE + compressedSize;
-                            totalSendTicks += (tSendEnd - sendStartTicks);
-                        }
-                        catch (Exception)
-                        {
-                            Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
-                            break;
+                            var header = PacketHeader.Create(
+                                frameType,
+                                (ushort)frame.Width,
+                                (ushort)frame.Height,
+                                (uint)originalSize,
+                                (uint)compressedSize,
+                                elapsedUs,
+                                seq,
+                                flags);
+
+                            long sendStartTicks = Stopwatch.GetTimestamp();
+                            try
+                            {
+                                Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
+                                packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
+                                long tSendEnd = Stopwatch.GetTimestamp();
+                                
+                                double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
+                                double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
+                                
+                                Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode(SubmitToComplete): {encodeSubmitToCompleteMs:F2}ms | Send: {sendMs:F2}ms");
+
+                                totalBytesSent += PacketHeader.SIZE + compressedSize;
+                                totalSendTicks += (tSendEnd - sendStartTicks);
+                            }
+                            catch (Exception)
+                            {
+                                Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
+                                break;
+                            }
                         }
                     }
 
@@ -853,33 +886,37 @@ public static class Program
                 long lz4EncodeTicks = Stopwatch.GetTimestamp() - encodeStartTicks;
                 totalEncodeTicks += lz4EncodeTicks;
 
-                long lz4ElapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                long lz4ElapsedUs = lz4ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                int lz4OriginalSize = frame.Width * frame.Height * 4;
-                ushort lz4Flags = sequenceNumber == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
-
-                var lz4Header = PacketHeader.Create(
-                    frameType,
-                    (ushort)frame.Width,
-                    (ushort)frame.Height,
-                    (uint)lz4OriginalSize,
-                    (uint)compressedSize,
-                    lz4ElapsedUs,
-                    sequenceNumber++,
-                    lz4Flags);
-
-                long lz4SendStartTicks = Stopwatch.GetTimestamp();
-                try
+                lock (streamLock)
                 {
-                    packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
-                    long tSendEnd = Stopwatch.GetTimestamp();
-                    totalBytesSent += PacketHeader.SIZE + compressedSize;
-                    totalSendTicks += (tSendEnd - lz4SendStartTicks);
-                }
-                catch (Exception)
-                {
-                    Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
-                    break;
+                    long lz4ElapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                    long lz4ElapsedUs = lz4ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                    int lz4OriginalSize = frame.Width * frame.Height * 4;
+                    uint lz4Seq = sequenceNumber++;
+                    ushort lz4Flags = lz4Seq == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
+
+                    var lz4Header = PacketHeader.Create(
+                        frameType,
+                        (ushort)frame.Width,
+                        (ushort)frame.Height,
+                        (uint)lz4OriginalSize,
+                        (uint)compressedSize,
+                        lz4ElapsedUs,
+                        lz4Seq,
+                        lz4Flags);
+
+                    long lz4SendStartTicks = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        packetWriter.WritePacket(clientStream!, lz4Header, compressedData, 0, compressedSize);
+                        long tSendEnd = Stopwatch.GetTimestamp();
+                        totalBytesSent += PacketHeader.SIZE + compressedSize;
+                        totalSendTicks += (tSendEnd - lz4SendStartTicks);
+                    }
+                    catch (Exception)
+                    {
+                        Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
+                        break;
+                    }
                 }
 
                 // FPS counter — update every second.
@@ -920,6 +957,19 @@ public static class Program
                     totalEncodeTicks = 0;
                     totalSendTicks = 0;
                     totalLoopIntervalTicks = 0;
+                }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[FATAL ERROR] Loop iteration {loopIteration} crashed: {ex.Message}");
+                    Console.WriteLine($"[FATAL ERROR] Stack Trace:\n{ex.StackTrace}");
+                    break;
+                }
+
+                if (!isClientConnected())
+                {
+                    Console.WriteLine("[NET] Client disconnected. Exiting stream loop.");
+                    break;
                 }
             }
 

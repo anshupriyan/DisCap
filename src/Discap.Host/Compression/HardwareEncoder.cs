@@ -26,7 +26,7 @@ public sealed class HardwareEncoder : IVideoEncoder
     public bool IsAvailable => _available;
 
     private NvEncoder _encoder;
-    private NvEncRegisteredPtr _registeredTexture;
+    private readonly System.Collections.Generic.Dictionary<IntPtr, NvEncRegisteredPtr> _registeredTextures = new();
     private NvEncOutputPtr _bitstreamBuffer;
 
     /// <summary>Win32 auto-reset event handle signaled by NVENC when a frame finishes encoding.</summary>
@@ -130,6 +130,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
         initParams.EncodeConfig->GopLength = 120;
         initParams.EncodeConfig->FrameIntervalP = 1; // B-frames = 0
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.RepeatSPSPPS = true;
 
         status = LibNvEnc.FunctionList.InitializeEncoder(_encoder, ref initParams);
         if (status != NvEncStatus.Success)
@@ -185,6 +187,12 @@ public sealed class HardwareEncoder : IVideoEncoder
     /// NVENC has no pending output — preventing indefinite hangs.
     /// </summary>
     private bool _frameSubmitted;
+    private bool _forceKeyFrameNext;
+
+    public void ForceKeyFrame()
+    {
+        _forceKeyFrameNext = true;
+    }
 
     public unsafe void SubmitFrame(FrameBuffer frame)
     {
@@ -196,14 +204,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         if (texturePtr == IntPtr.Zero) return;
 
         // Register texture if it's new
-        if (texturePtr != _lastTexturePointer)
+        if (!_registeredTextures.TryGetValue(texturePtr, out var registeredRes))
         {
-            if (_registeredTexture.Handle != IntPtr.Zero)
-            {
-                LibNvEnc.FunctionList.UnregisterResource(_encoder, _registeredTexture);
-                _registeredTexture.Handle = IntPtr.Zero;
-            }
-
             var regParams = new NvEncRegisterResource
             {
                 Version = LibNvEnc.NV_ENC_REGISTER_RESOURCE_VER,
@@ -221,17 +223,25 @@ public sealed class HardwareEncoder : IVideoEncoder
                 Console.Error.WriteLine($"[ENC] RegisterResource failed: {status}");
                 return;
             }
-            _registeredTexture = regParams.RegisteredResource;
-            _lastTexturePointer = texturePtr;
+            registeredRes = regParams.RegisteredResource;
+            _registeredTextures[texturePtr] = registeredRes;
         }
 
         // Map resource
         var mapParams = new NvEncMapInputResource
         {
             Version = LibNvEnc.NV_ENC_MAP_INPUT_RESOURCE_VER,
-            RegisteredResource = _registeredTexture
+            RegisteredResource = registeredRes
         };
         if (LibNvEnc.FunctionList.MapInputResource(_encoder, ref mapParams) != NvEncStatus.Success) return;
+
+        uint picFlags = 0;
+        if (_forceKeyFrameNext)
+        {
+            _forceKeyFrameNext = false;
+            picFlags = 0x00000001u | 0x00000002u; // NV_ENC_PIC_FLAG_FORCEINTRA | NV_ENC_PIC_FLAG_FORCEIDR
+            Console.WriteLine("[IDR-FORCE] Applying NV_ENC_PIC_FORCE_IDR flag for clean post-idle sync.");
+        }
 
         // Encode picture — async mode: set CompletionEvent so NVENC signals
         // when this frame's output is ready. EncodePicture returns immediately.
@@ -241,6 +251,7 @@ public sealed class HardwareEncoder : IVideoEncoder
             InputWidth = (uint)_width,
             InputHeight = (uint)_height,
             InputPitch = (uint)_width,
+            EncodePicFlags = picFlags,
             InputBuffer = mapParams.MappedResource,
             OutputBitstream = _bitstreamBuffer,
             BufferFmt = mapParams.MappedBufferFmt,
@@ -445,6 +456,8 @@ public sealed class HardwareEncoder : IVideoEncoder
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
         initParams.EncodeConfig->GopLength = 120;
         initParams.EncodeConfig->FrameIntervalP = 1;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.RepeatSPSPPS = true;
 
         var reconfigParams = new NvEncReconfigureParams
         {
@@ -538,11 +551,6 @@ public sealed class HardwareEncoder : IVideoEncoder
         }
     }
 
-    public void ForceKeyFrame()
-    {
-        // P/Invoke force IDR flag not strictly necessary for simple desktop streaming
-    }
-
     public void Dispose()
     {
         _available = false;
@@ -563,8 +571,12 @@ public sealed class HardwareEncoder : IVideoEncoder
 
             if (_bitstreamBuffer.Handle != IntPtr.Zero)
                 LibNvEnc.FunctionList.DestroyBitstreamBuffer(_encoder, _bitstreamBuffer);
-            if (_registeredTexture.Handle != IntPtr.Zero)
-                LibNvEnc.FunctionList.UnregisterResource(_encoder, _registeredTexture);
+            foreach (var reg in _registeredTextures.Values)
+            {
+                if (reg.Handle != IntPtr.Zero)
+                    LibNvEnc.FunctionList.UnregisterResource(_encoder, reg);
+            }
+            _registeredTextures.Clear();
                 
             LibNvEnc.FunctionList.DestroyEncoder(_encoder);
             _encoder.Handle = IntPtr.Zero;

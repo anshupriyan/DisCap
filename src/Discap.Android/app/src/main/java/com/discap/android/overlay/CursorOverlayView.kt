@@ -29,19 +29,7 @@ class CursorOverlayView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val matrix = Matrix()
 
-    private var isIBeam = false
-    private var iBeamWidth = 0
-    private var iBeamHeight = 0
-
-    fun setIBeamMode(enabled: Boolean, w: Int, h: Int) {
-        this.isIBeam = enabled
-        this.iBeamWidth = w
-        this.iBeamHeight = h
-        postInvalidate()
-    }
-
     fun updatePosition(x: Int, y: Int, visible: Boolean) {
-        Log.d("DISCAP-CURSOR", "🔄 VIEW UPDATED: Invalidating...")
         this.hasReceivedFirstPacket = true
         this.cursorX = x.toFloat()
         this.cursorY = y.toFloat()
@@ -111,52 +99,11 @@ class CursorOverlayView(context: Context) : View(context) {
         val scaleX = drawnW / desktopWidth.toFloat()
         val scaleY = drawnH / desktopHeight.toFloat()
 
-        val scaledX = offsetX + cursorX * scaleX
-        val scaledY = offsetY + cursorY * scaleY
-
-        if (isIBeam) {
-            val centerX = scaledX
-            val topY = scaledY - (iBeamHeight / 2f * scaleY)
-            val bottomY = scaledY + (iBeamHeight / 2f * scaleY)
-            val capWidth = iBeamWidth * 0.3f * scaleX
-
-            val blackPaint = Paint().apply {
-                style = Paint.Style.FILL
-                color = Color.BLACK
-                isAntiAlias = true
-            }
-
-            val whitePaint = Paint().apply {
-                style = Paint.Style.FILL
-                color = Color.WHITE
-                isAntiAlias = true
-            }
-
-            val shadowWidth = 3f * scaleX
-            val capHeight = 4f * scaleY
-            val coreWidth = 1.5f * scaleX
-            val coreInsetY = 2f * scaleY
-            val capCoreInsetX = 2f * scaleX
-
-            // 1. Solid Black Base / Shadow (Outline)
-            canvas.drawRect(centerX - shadowWidth, topY, centerX + shadowWidth, bottomY, blackPaint) // Stem Base
-            canvas.drawRect(centerX - capWidth, topY, centerX + capWidth, topY + capHeight, blackPaint) // Top Cap Base
-            canvas.drawRect(centerX - capWidth, bottomY - capHeight, centerX + capWidth, bottomY, blackPaint) // Bottom Cap Base
-
-            // 2. Solid White Core
-            canvas.drawRect(centerX - coreWidth, topY + coreInsetY, centerX + coreWidth, bottomY - coreInsetY, whitePaint) // Stem Core
-            canvas.drawRect(centerX - capWidth + capCoreInsetX, topY + coreInsetY, centerX + capWidth - capCoreInsetX, topY + capHeight, whitePaint) // Top Cap Core
-            canvas.drawRect(centerX - capWidth + capCoreInsetX, bottomY - capHeight, centerX + capWidth - capCoreInsetX, bottomY - coreInsetY, whitePaint) // Bottom Cap Core
-
-            return // Exit onDraw, do not draw the bitmap
-        }
-
         val bitmap = cursorBitmap
         if (bitmap != null) {
             val drawX = offsetX + (cursorX - hotspotX.toFloat()) * scaleX
             val drawY = offsetY + (cursorY - hotspotY.toFloat()) * scaleY
 
-            Log.d("DISCAP-CURSOR", "🎨 DRAWING BITMAP: ${bitmap.width}x${bitmap.height}, Hotspot=($hotspotX, $hotspotY)")
             matrix.reset()
             matrix.postScale(scaleX, scaleY)
             matrix.postTranslate(drawX, drawY)

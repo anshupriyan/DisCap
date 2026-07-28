@@ -1,10 +1,6 @@
 package com.discap.android.overlay
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.PorterDuff
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -23,12 +19,14 @@ class CursorManager(private val overlayView: CursorOverlayView) {
     }
 
     fun onCursorPosReceived(payload: ByteArray) {
+        Log.d("DISCAP-CURSOR", "🧬 RX HEX Type 3: ${payload.joinToString(" ") { String.format("%02X", it) }}")
         if (payload.size < 9) return
 
         val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         val x = bb.int
         val y = bb.int
         val visible = bb.get().toInt() != 0
+        Log.d("DISCAP-CURSOR", "🧠 PARSED: X=$x, Y=$y, Visible=$visible")
 
         mainHandler.post {
             overlayView.updatePosition(x, y, visible)
@@ -36,6 +34,7 @@ class CursorManager(private val overlayView: CursorOverlayView) {
     }
 
     fun onCursorShapeReceived(payload: ByteArray) {
+        Log.d("DISCAP-CURSOR", "🧬 RX HEX Type 4: ${payload.joinToString(" ") { String.format("%02X", it) }}")
         if (payload.size < 28) return
 
         val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
@@ -48,9 +47,9 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         val bufferSize = bb.getInt(24)
 
         if (type == 1) {
-            Log.d("DISCAP-CURSOR", "🚨 USING TYPE 1 DIRECT CANVAS MODE!")
+            Log.i("Discap.Cursor", "Shape updated: Type $type (Using fallback)")
             mainHandler.post {
-                overlayView.setIBeamMode(true, width, height / 2)
+                overlayView.updateShape(null, 0, 0)
             }
             return
         }
@@ -71,7 +70,7 @@ class CursorManager(private val overlayView: CursorOverlayView) {
                     decodeColorBitmap(width, height, shapeBuffer)
                 }
                 else -> {
-                    Log.w("Discap.Cursor", "Unknown pointer shape type: $type")
+                    Log.i("Discap.Cursor", "Shape updated: Type $type (Using fallback)")
                     null
                 }
             }
@@ -85,7 +84,6 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         }
 
         mainHandler.post {
-            overlayView.setIBeamMode(false, 0, 0)
             overlayView.updateShape(bitmap, hotspotX, hotspotY)
         }
     }
@@ -176,22 +174,5 @@ class CursorManager(private val overlayView: CursorOverlayView) {
             if ((p ushr 24) != 0) return false
         }
         return true
-    }
-
-    private fun createFallbackBitmap(): Bitmap {
-        val size = 32
-        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-        // Black outer circle
-        paint.color = Color.BLACK
-        canvas.drawCircle(size / 2f, size / 2f, 14f, paint)
-
-        // White inner circle
-        paint.color = Color.WHITE
-        canvas.drawCircle(size / 2f, size / 2f, 10f, paint)
-
-        return bitmap
     }
 }
