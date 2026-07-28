@@ -99,7 +99,7 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
 
         surfaceTexture = SurfaceTexture(oesTextureId).apply {
-            setDefaultBufferSize(streamWidth, streamHeight)
+            setDefaultBufferSize(3840, 2160)
             setOnFrameAvailableListener(this@OpenGLRenderer)
         }
         surface = Surface(surfaceTexture)
@@ -109,11 +109,10 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
     }
 
     fun updateStreamResolution(width: Int, height: Int) {
-        if (width > 0 && height > 0) {
+        if (width > 0 && height > 0 && (streamWidth != width || streamHeight != height)) {
             streamWidth = width
             streamHeight = height
-            surfaceTexture?.setDefaultBufferSize(width, height)
-            Log.i("DisCap-GL", "[GL] Updated SurfaceTexture buffer size to ${width}x${height}")
+            Log.i("DisCap-GL", "[GL] Updated stream resolution to ${width}x${height}")
         }
     }
 
