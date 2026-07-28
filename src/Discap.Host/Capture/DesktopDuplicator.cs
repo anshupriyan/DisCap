@@ -63,6 +63,7 @@ public sealed class DesktopDuplicator : IDisposable
     private ID3D11Texture2D? _stagingNv12Texture;
     private ID3D11Texture2D? _nvencTexture;
     private ColorConverter? _colorConverter;
+    private ID3D11Query? _syncQuery;
     private byte[] _pointerShapeBuffer = Array.Empty<byte>();
     private OutduplPointerShapeInfo _pointerShapeInfo;
     private OutduplPointerPosition _lastPointerPosition;
@@ -279,6 +280,9 @@ public sealed class DesktopDuplicator : IDisposable
             };
             _nvencTexture = _device.CreateTexture2D(nvencDesc);
 
+            var queryDesc = new QueryDescription(QueryType.Event);
+            _syncQuery = _device.CreateQuery(queryDesc);
+
             SetDefaultCursorShape();
 
             Console.WriteLine("[CAP] Desktop Duplication initialized");
@@ -362,10 +366,22 @@ public sealed class DesktopDuplicator : IDisposable
             
             // Copy to the plain NVENC texture (must have no bind flags and NV12 format)
             _context.CopyResource(_nvencTexture!, nv12Target);
+            if (_syncQuery != null)
+            {
+                _context.End(_syncQuery);
+            }
             
             // Flush the GPU context to ensure the compute shader and copy are completed
             // before NVENC attempts to read from the texture.
             _context.Flush();
+
+            if (_syncQuery != null)
+            {
+                while (!_context.GetData(_syncQuery, out bool isCompleted) || !isCompleted)
+                {
+                    Thread.SpinWait(10);
+                }
+            }
             
             long t3 = Stopwatch.GetTimestamp();
 
@@ -711,6 +727,8 @@ public sealed class DesktopDuplicator : IDisposable
         _gpuSrv = null;
         _colorConverter?.Dispose();
         _colorConverter = null;
+        _syncQuery?.Dispose();
+        _syncQuery = null;
         _context?.Dispose();
         _context = null;
         _device?.Dispose();

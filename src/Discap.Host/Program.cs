@@ -435,6 +435,11 @@ public static class Program
                 Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
                 if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
 
+                if (loopIteration % 10 == 0)
+                {
+                    duplicator.GpuKeepAlive();
+                }
+
                 int fpsCap = streamSettings.FpsCap;
                 // When Native (0), pace to the display's actual refresh rate
                 int effectivePacingFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
