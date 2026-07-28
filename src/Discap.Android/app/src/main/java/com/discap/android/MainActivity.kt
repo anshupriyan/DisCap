@@ -389,8 +389,7 @@ class MainActivity : Activity() {
                 detectedStreamResLabel.text = "Stream Res: ${videoWidth}x${videoHeight} -> Device Screen: ${screenW}x${screenH}"
             }
 
-            openGLRenderer?.streamWidth = videoWidth
-            openGLRenderer?.streamHeight = videoHeight
+            openGLRenderer?.updateStreamResolution(videoWidth, videoHeight)
             
             val parent = glSurfaceView.parent as? View ?: return@runOnUiThread
             val parentWidth = parent.width

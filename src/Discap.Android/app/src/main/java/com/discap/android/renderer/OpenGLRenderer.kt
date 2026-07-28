@@ -31,15 +31,14 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
 
     @Volatile
     private var frameAvailable = false
-    
-    private val frameSyncObject = Object()
+    private var hasTextureUpdated = false
 
     // Render parameters
     var sharpness: Float = 0.5f // Range 0.0f (Off) to 1.0f (Max CAS)
     var streamWidth: Int = 1920
     var streamHeight: Int = 1080
-    var targetViewportWidth: Int = 1920
-    var targetViewportHeight: Int = 1080
+    var targetViewportWidth: Int = 0
+    var targetViewportHeight: Int = 0
 
     private var programId: Int = 0
     private var aPositionHandle: Int = 0
@@ -63,7 +62,7 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
          1.0f,  1.0f
     )
 
-    // Texture Coordinates (Y-flipped for Android OES)
+    // Texture Coordinates
     private val textureCoordinates = floatArrayOf(
         0.0f, 0.0f,
         1.0f, 0.0f,
@@ -100,27 +99,37 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
 
         surfaceTexture = SurfaceTexture(oesTextureId).apply {
+            setDefaultBufferSize(streamWidth, streamHeight)
             setOnFrameAvailableListener(this@OpenGLRenderer)
         }
         surface = Surface(surfaceTexture)
 
         createProgram()
-        Log.i("DisCap-GL", "[GL] OpenGL ES 3.0 AMD CAS Renderer initialized with OES texture #$oesTextureId")
+        Log.i("DisCap-GL", "[GL] OpenGL ES 3.0 AMD CAS Renderer initialized (${streamWidth}x${streamHeight}) with OES texture #$oesTextureId")
     }
 
-    override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
-        synchronized(frameSyncObject) {
-            frameAvailable = true
-            frameSyncObject.notifyAll()
+    fun updateStreamResolution(width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            streamWidth = width
+            streamHeight = height
+            surfaceTexture?.setDefaultBufferSize(width, height)
+            Log.i("DisCap-GL", "[GL] Updated SurfaceTexture buffer size to ${width}x${height}")
         }
     }
 
+    override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
+        frameAvailable = true
+    }
+
     fun updateTexture() {
-        synchronized(frameSyncObject) {
-            if (frameAvailable) {
+        if (frameAvailable) {
+            try {
                 surfaceTexture?.updateTexImage()
                 surfaceTexture?.getTransformMatrix(stMatrix)
                 frameAvailable = false
+                hasTextureUpdated = true
+            } catch (e: Exception) {
+                Log.e("DisCap-GL", "[GL] updateTexImage failed: ${e.message}")
             }
         }
     }
@@ -131,15 +140,34 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         GLES30.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
 
+        if (programId == 0 || !hasTextureUpdated) return
+
         GLES30.glUseProgram(programId)
 
-        // Center the scaled viewport on screen
-        val vpWidth = if (targetViewportWidth > 0) targetViewportWidth else screenWidth
-        val vpHeight = if (targetViewportHeight > 0) targetViewportHeight else screenHeight
-        val offsetX = (screenWidth - vpWidth) / 2
-        val offsetY = (screenHeight - vpHeight) / 2
+        // Calculate aspect-ratio fit within target viewport or screen
+        val targetW = if (targetViewportWidth > 0) targetViewportWidth else screenWidth
+        val targetH = if (targetViewportHeight > 0) targetViewportHeight else screenHeight
 
-        GLES30.glViewport(offsetX, offsetY, vpWidth, vpHeight)
+        val videoW = if (streamWidth > 0) streamWidth else 1920
+        val videoH = if (streamHeight > 0) streamHeight else 1080
+
+        val videoRatio = videoW.toFloat() / videoH.toFloat()
+        val targetRatio = targetW.toFloat() / targetH.toFloat()
+
+        val renderW: Int
+        val renderH: Int
+        if (videoRatio > targetRatio) {
+            renderW = targetW
+            renderH = (targetW / videoRatio).toInt()
+        } else {
+            renderH = targetH
+            renderW = (targetH * videoRatio).toInt()
+        }
+
+        val offsetX = (screenWidth - renderW) / 2
+        val offsetY = (screenHeight - renderH) / 2
+
+        GLES30.glViewport(offsetX, offsetY, renderW, renderH)
 
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
@@ -147,7 +175,7 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         GLES30.glUniformMatrix4fv(uMVPMatrixHandle, 1, false, mvpMatrix, 0)
         GLES30.glUniformMatrix4fv(uSTMatrixHandle, 1, false, stMatrix, 0)
         GLES30.glUniform1f(uSharpnessHandle, sharpness)
-        GLES30.glUniform2f(uTextureSizeHandle, streamWidth.toFloat(), streamHeight.toFloat())
+        GLES30.glUniform2f(uTextureSizeHandle, videoW.toFloat(), videoH.toFloat())
 
         GLES30.glEnableVertexAttribArray(aPositionHandle)
         GLES30.glVertexAttribPointer(aPositionHandle, 2, GLES30.GL_FLOAT, false, 8, vertexBuffer)
@@ -239,8 +267,9 @@ uniform float uSharpness; // 0.0 (Off) to 1.0 (Max Sharpness)
 uniform vec2 uTextureSize;
 
 void main() {
+    vec4 centerColor = texture(uTexture, vTexCoord);
     if (uSharpness <= 0.001) {
-        fragColor = texture(uTexture, vTexCoord);
+        fragColor = centerColor;
         return;
     }
 
@@ -248,22 +277,21 @@ void main() {
     vec2 dy = vec2(0.0, 1.0 / uTextureSize.y);
 
     // Sample 3x3 cross neighborhood
-    vec3 a = texture(uTexture, vTexCoord - dx - dy).rgb;
     vec3 b = texture(uTexture, vTexCoord - dy).rgb;
-    vec3 c = texture(uTexture, vTexCoord + dx - dy).rgb;
     vec3 d = texture(uTexture, vTexCoord - dx).rgb;
-    vec3 e = texture(uTexture, vTexCoord).rgb;
+    vec3 e = centerColor.rgb;
     vec3 f = texture(uTexture, vTexCoord + dx).rgb;
-    vec3 g = texture(uTexture, vTexCoord - dx + dy).rgb;
     vec3 h = texture(uTexture, vTexCoord + dy).rgb;
-    vec3 i = texture(uTexture, vTexCoord + dx + dy).rgb;
 
     // Min/Max bounds for local contrast weighting
     vec3 minColor = min(min(min(d, e), min(f, b)), h);
     vec3 maxColor = max(max(max(d, e), max(f, b)), h);
 
+    // Safe max color to prevent division by zero / NaN in dark background areas
+    vec3 safeMaxColor = max(maxColor, vec3(0.0001));
+
     // Compute CAS peak sharpening weight
-    vec3 amp = clamp(min(minColor, 2.0 - maxColor) / maxColor, 0.0, 1.0);
+    vec3 amp = clamp(min(minColor, 2.0 - safeMaxColor) / safeMaxColor, 0.0, 1.0);
     vec3 w = sqrt(amp) * (-0.125 * uSharpness);
 
     // Filter sum
