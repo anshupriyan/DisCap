@@ -122,8 +122,19 @@ class MainActivity : Activity() {
         }
         cursorManager = com.discap.android.overlay.CursorManager(cursorOverlayView)
 
-        val root = FrameLayout(this)
-        root.setBackgroundColor(Color.BLACK)
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            setOnTouchListener { _, event ->
+                if (settingsPanel.visibility == View.VISIBLE) {
+                    val rect = android.graphics.Rect()
+                    settingsPanel.getGlobalVisibleRect(rect)
+                    if (rect.contains(event.x.toInt(), event.y.toInt())) {
+                        return@setOnTouchListener false
+                    }
+                }
+                sendTouch(event)
+            }
+        }
         root.addView(glSurfaceView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
@@ -357,11 +368,17 @@ class MainActivity : Activity() {
     private fun sendTouch(event: MotionEvent): Boolean {
         val sender = socketReceiver?.sender ?: return false
 
-        val viewW = if (glSurfaceView.width > 0) glSurfaceView.width else 1
-        val viewH = if (glSurfaceView.height > 0) glSurfaceView.height else 1
+        val location = IntArray(2)
+        glSurfaceView.getLocationOnScreen(location)
 
-        val xNorm = event.x / viewW
-        val yNorm = event.y / viewH
+        val relX = event.rawX - location[0]
+        val relY = event.rawY - location[1]
+
+        val viewW = if (glSurfaceView.width > 0) glSurfaceView.width.toFloat() else 1f
+        val viewH = if (glSurfaceView.height > 0) glSurfaceView.height.toFloat() else 1f
+
+        val xNorm = (relX / viewW).coerceIn(0f, 1f)
+        val yNorm = (relY / viewH).coerceIn(0f, 1f)
 
         val action = when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 1.toByte()
@@ -373,6 +390,7 @@ class MainActivity : Activity() {
         val button = if (action == 0.toByte()) 0.toByte() else 1.toByte()
         val pressure = (event.pressure * 255).toInt().toByte()
 
+        Log.d("DisCap.Touch", "Sending touch: xNorm=$xNorm, yNorm=$yNorm, action=$action")
         sender.sendInput(xNorm, yNorm, action, button, pressure)
         return true
     }
