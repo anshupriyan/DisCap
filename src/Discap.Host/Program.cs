@@ -432,9 +432,6 @@ public static class Program
 
             int lastSentCursorX = -10000;
             int lastSentCursorY = -10000;
-            int lastLoggedCursorX = -10000;
-            int lastLoggedCursorY = -10000;
-            bool lastSentCursorVisible = false;
             byte[]? cachedShapeBuffer = null;
             uint cachedShapeType = 0;
             long lastGdiKeepAliveMs = 0;
@@ -538,12 +535,6 @@ public static class Program
                     try
                     {
                         packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
-                        if (Math.Abs(relX - lastLoggedCursorX) > 10 || Math.Abs(relY - lastLoggedCursorY) > 10)
-                        {
-                            lastLoggedCursorX = relX;
-                            lastLoggedCursorY = relY;
-                            Console.WriteLine($"[CURSOR-SEND] Type 3 -> X:{relX}, Y:{relY}");
-                        }
                     }
                     catch (Exception)
                     {
@@ -592,7 +583,6 @@ public static class Program
 
                         try
                         {
-                            Console.WriteLine($"[NET] SENT CURSOR SHAPE: Type={currentShapeInfo.Type}, W={currentShapeInfo.Width}, H={currentShapeInfo.Height}, PayloadSize={shapePayload.Length}");
                             packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
                         }
                         catch (Exception)

@@ -1,10 +1,6 @@
 package com.discap.android.overlay
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.PorterDuff
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -48,9 +44,9 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         val bufferSize = bb.getInt(24)
 
         if (type == 1) {
-            Log.d("DISCAP-CURSOR", "🚨 USING TYPE 1 DIRECT CANVAS MODE!")
+            Log.i("Discap.Cursor", "Shape updated: Type $type (Using fallback)")
             mainHandler.post {
-                overlayView.setIBeamMode(true, width, height / 2)
+                overlayView.updateShape(null, 0, 0)
             }
             return
         }
@@ -71,7 +67,7 @@ class CursorManager(private val overlayView: CursorOverlayView) {
                     decodeColorBitmap(width, height, shapeBuffer)
                 }
                 else -> {
-                    Log.w("Discap.Cursor", "Unknown pointer shape type: $type")
+                    Log.i("Discap.Cursor", "Shape updated: Type $type (Using fallback)")
                     null
                 }
             }
@@ -85,7 +81,6 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         }
 
         mainHandler.post {
-            overlayView.setIBeamMode(false, 0, 0)
             overlayView.updateShape(bitmap, hotspotX, hotspotY)
         }
     }
