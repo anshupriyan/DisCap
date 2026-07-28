@@ -40,21 +40,12 @@ public static class Program
     private static extern IntPtr CreateDC(string? lpszDriver, string lpszDevice, string? lpszOutput, IntPtr lpInitData);
 
     [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern IntPtr CreateSolidBrush(uint crColor);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern bool PatBlt(IntPtr hdc, int nXLeft, int nYLeft, int nWidth, int nHeight, uint dwRop);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern bool DeleteObject(IntPtr hObject);
+    private static extern bool BitBlt(IntPtr hdc, int nXDest, int nYDest, int nWidth, int nHeight, IntPtr hdcSrc, int nXSrc, int nYSrc, uint dwRop);
 
     [System.Runtime.InteropServices.DllImport("gdi32.dll")]
     private static extern bool DeleteDC(IntPtr hdc);
 
-    private const uint PATCOPY = 0x00F00021;
+    private const uint SRCCOPY = 0x00CC0020;
 
     private static volatile bool _running = true;
 
@@ -435,7 +426,7 @@ public static class Program
             byte[]? cachedShapeBuffer = null;
             uint cachedShapeType = 0;
             long lastGdiKeepAliveMs = 0;
-            bool gdiToggleColor = false;
+            long lastKeepAliveLogMs = 0;
 
             // ─── Capture loop ─────────────────────────────────────────
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
@@ -477,26 +468,23 @@ public static class Program
                 if (currentMs - lastGdiKeepAliveMs >= 250)
                 {
                     lastGdiKeepAliveMs = currentMs;
-                    gdiToggleColor = !gdiToggleColor;
-                    uint brushColor = gdiToggleColor ? 0x00010101u : 0x00000000u; // RGB(1,1,1) vs RGB(0,0,0)
 
                     if (!string.IsNullOrEmpty(duplicator.DeviceName))
                     {
                         IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
                         if (hdc != IntPtr.Zero)
                         {
-                            IntPtr hBrush = CreateSolidBrush(brushColor);
-                            if (hBrush != IntPtr.Zero)
-                            {
-                                IntPtr hOldBrush = SelectObject(hdc, hBrush);
-                                int bltX = Math.Max(0, duplicator.Width - 32);
-                                int bltY = Math.Max(0, duplicator.Height - 32);
-                                PatBlt(hdc, bltX, bltY, 32, 32, PATCOPY);
-                                SelectObject(hdc, hOldBrush);
-                                DeleteObject(hBrush);
-                            }
+                            int targetX = Math.Max(0, duplicator.Width - 4);
+                            int targetY = Math.Max(0, duplicator.Height - 4);
+                            BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
                             DeleteDC(hdc);
                         }
+                    }
+
+                    if (currentMs - lastKeepAliveLogMs >= 1000)
+                    {
+                        lastKeepAliveLogMs = currentMs;
+                        Console.WriteLine("[KEEP-ALIVE] Invisible DXGI Ping");
                     }
                 }
 
@@ -618,28 +606,10 @@ public static class Program
                         postIdleFrameCount = 0;
                     }
                 }
-                else if (lastFrame != null && nvencAvailable && !config.ForceLz4Only)
-                {
-                    // Screen is static — feed last frame to NVENC so it emits inter frames.
-                    frame = lastFrame;
-                    bool cursorMoved = duplicator.RecompositeCursorIfMoved(frame);
-                    isRepeatFrame = !cursorMoved;
-                    wasIdle = true;
-
-                    // GPU keep-alive: periodically poke the GPU during idle to prevent
-                    // power-state downclocking. Throttled to avoid flooding the command queue.
-                    long nowKA = Stopwatch.GetTimestamp();
-                    if (nowKA - lastGpuKeepAliveTicks >= gpuKeepAliveIntervalTicks)
-                    {
-                        duplicator.GpuKeepAlive();
-                        lastGpuKeepAliveTicks = nowKA;
-                    }
-
-                    Console.WriteLine($"[LOOP] {loopIteration}: timeout — {(cursorMoved ? "cursor moved, re-composited" : "resending last frame unchanged")}");
-                }
                 else
                 {
-                    Console.WriteLine($"[LOOP] {loopIteration}: timeout, no previous frame — skipping");
+                    // Screen is static — timeout on AcquireNextFrame.
+                    // Graceful Wake-Up: Silently drop missed frame to prevent network/decoder clogging during GPU wake-up
                     continue;
                 }
 
