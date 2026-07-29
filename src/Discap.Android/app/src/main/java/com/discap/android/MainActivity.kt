@@ -47,11 +47,13 @@ class MainActivity : Activity() {
     private var fpsCap = 0  // 0 = Native (no cap, matches display refresh rate)
     private var resolutionScale = 100
     private var encoderMode = ENCODER_AUTO
-    private var showStats = false
-    private var cqLevel = 28  // NVENC Target Quality (range 15-40, default 28)
+    private var upscaleTargetTier = 200
+    private var scaleModeOrdinal = OpenGLRenderer.ScaleMode.STRETCH.ordinal
+    private var gpuTimingEnabled = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        loadSavedSettings()
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -98,6 +100,7 @@ class MainActivity : Activity() {
                     activeSurface = codecSurface
 
                     runOnUiThread {
+                        applyRendererSettings()
                         startReceiversWithSurface(codecSurface)
                     }
                 }
@@ -210,6 +213,73 @@ class MainActivity : Activity() {
         sendSettings()
     }
 
+    private fun loadSavedSettings() {
+        val prefs = getSharedPreferences("DiscapSettings", MODE_PRIVATE)
+        bitrateMbps = prefs.getInt("bitrateMbps", 20)
+        cqLevel = prefs.getInt("cqLevel", 28)
+        casSharpeningPercent = prefs.getInt("casSharpeningPercent", 50)
+        fpsCap = prefs.getInt("fpsCap", 0)
+        upscaleTargetTier = prefs.getInt("upscaleTargetTier", 200)
+        scaleModeOrdinal = prefs.getInt("scaleModeOrdinal", OpenGLRenderer.ScaleMode.STRETCH.ordinal)
+        resolutionScale = prefs.getInt("resolutionScale", 100)
+        encoderMode = prefs.getInt("encoderMode", ENCODER_AUTO)
+        showStats = prefs.getBoolean("showStats", false)
+        gpuTimingEnabled = prefs.getBoolean("gpuTimingEnabled", true)
+    }
+
+    private fun saveSettings() {
+        val prefs = getSharedPreferences("DiscapSettings", MODE_PRIVATE)
+        prefs.edit()
+            .putInt("bitrateMbps", bitrateMbps)
+            .putInt("cqLevel", cqLevel)
+            .putInt("casSharpeningPercent", casSharpeningPercent)
+            .putInt("fpsCap", fpsCap)
+            .putInt("upscaleTargetTier", upscaleTargetTier)
+            .putInt("scaleModeOrdinal", scaleModeOrdinal)
+            .putInt("resolutionScale", resolutionScale)
+            .putInt("encoderMode", encoderMode)
+            .putBoolean("showStats", showStats)
+            .putBoolean("gpuTimingEnabled", gpuTimingEnabled)
+            .apply()
+    }
+
+    private fun applyRendererSettings() {
+        val renderer = openGLRenderer ?: return
+        renderer.sharpness = casSharpeningPercent / 100.0f
+        renderer.scaleMode = OpenGLRenderer.ScaleMode.entries.getOrElse(scaleModeOrdinal) { OpenGLRenderer.ScaleMode.STRETCH }
+        renderer.gpuTimingEnabled = gpuTimingEnabled
+        applyUpscaleTargetTier(upscaleTargetTier)
+
+        glSurfaceView.scaleX = resolutionScale / 100f
+        glSurfaceView.scaleY = resolutionScale / 100f
+
+        if (::statsView.isInitialized) {
+            statsView.visibility = if (showStats) View.VISIBLE else View.GONE
+        }
+    }
+
+    private fun applyUpscaleTargetTier(tier: Int) {
+        upscaleTargetTier = tier
+        val renderer = openGLRenderer ?: return
+        val screenW = resources.displayMetrics.widthPixels
+        val screenH = resources.displayMetrics.heightPixels
+        when (tier) {
+            100 -> {
+                renderer.targetViewportWidth = currentStreamW
+                renderer.targetViewportHeight = currentStreamH
+            }
+            115 -> {
+                renderer.targetViewportWidth = (currentStreamW * 1.15f).toInt()
+                renderer.targetViewportHeight = (currentStreamH * 1.15f).toInt()
+            }
+            200 -> {
+                renderer.targetViewportWidth = screenW
+                renderer.targetViewportHeight = screenH
+            }
+        }
+        renderer.invalidateWarmup()
+    }
+
     private fun buildSettingsPanel(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -239,7 +309,13 @@ class MainActivity : Activity() {
             })
 
             addView(label("Target Quality / Compression Level (CQ) (Lower = Better Quality, Higher = More Compression)"))
-            val cqValue = label("${cqLevel} (Default: 28)")
+            val cqValueText = when (cqLevel) {
+                15 -> "$cqLevel (Best)"
+                28 -> "$cqLevel (Default)"
+                40 -> "$cqLevel (Lowest)"
+                else -> "$cqLevel"
+            }
+            val cqValue = label(cqValueText)
             addView(cqValue)
             addView(SeekBar(this@MainActivity).apply {
                 max = 25  // range: 15 to 40
@@ -263,7 +339,13 @@ class MainActivity : Activity() {
             addView(detectedStreamResLabel)
 
             addView(label("AMD CAS Sharpening (Mobile GPU Post-Processing)"))
-            casSharpnessValueLabel = label("50% (Balanced CAS)")
+            val initialCasStr = when {
+                casSharpeningPercent == 0 -> "0% (Off - Bilinear Soft)"
+                casSharpeningPercent < 40 -> "$casSharpeningPercent% (Light CAS)"
+                casSharpeningPercent in 40..65 -> "$casSharpeningPercent% (Balanced CAS)"
+                else -> "$casSharpeningPercent% (Ultra Sharp CAS)"
+            }
+            casSharpnessValueLabel = label(initialCasStr)
             addView(casSharpnessValueLabel)
             addView(SeekBar(this@MainActivity).apply {
                 max = 100
@@ -279,9 +361,10 @@ class MainActivity : Activity() {
                         }
                         casSharpnessValueLabel.text = percentStr
                         openGLRenderer?.sharpness = progress / 100.0f
+                        saveSettings()
                     }
                     override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                    override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                    override fun onStopTrackingTouch(seekBar: SeekBar?) { saveSettings() }
                 })
             })
 
@@ -292,38 +375,28 @@ class MainActivity : Activity() {
             val screenW = resources.displayMetrics.widthPixels
             val screenH = resources.displayMetrics.heightPixels
             addView(buttonRow(listOf("1.0x Native" to 100, "1.15x Ultra" to 115, "Screen Native ($screenW x $screenH)" to 200)) { targetTier ->
-                when (targetTier) {
-                    100 -> {
-                        openGLRenderer?.targetViewportWidth = currentStreamW
-                        openGLRenderer?.targetViewportHeight = currentStreamH
-                    }
-                    115 -> {
-                        openGLRenderer?.targetViewportWidth = (currentStreamW * 1.15f).toInt()
-                        openGLRenderer?.targetViewportHeight = (currentStreamH * 1.15f).toInt()
-                    }
-                    200 -> {
-                        openGLRenderer?.targetViewportWidth = screenW
-                        openGLRenderer?.targetViewportHeight = screenH
-                    }
-                }
-                openGLRenderer?.invalidateWarmup()
+                applyUpscaleTargetTier(targetTier)
+                saveSettings()
             })
 
             addView(label("Scale Mode"))
             addView(buttonRow(listOf("Fit" to 0, "Fill" to 1, "Stretch" to 2)) {
-                openGLRenderer?.scaleMode = OpenGLRenderer.ScaleMode.entries[it]
+                scaleModeOrdinal = it
+                applyRendererSettings()
+                saveSettings()
             })
 
             addView(label("Resolution scale"))
             addView(buttonRow(listOf("50%" to 50, "75%" to 75, "100%" to 100)) {
                 resolutionScale = it
-                glSurfaceView.scaleX = it / 100f
-                glSurfaceView.scaleY = it / 100f
+                applyRendererSettings()
+                sendSettings()
             })
 
             addView(label("Encoder"))
             addView(buttonRow(listOf("H.264" to ENCODER_H264, "LZ4" to ENCODER_LZ4, "Auto" to ENCODER_AUTO)) {
                 encoderMode = it
+                sendSettings()
             })
 
             addView(Button(this@MainActivity).apply {
@@ -331,21 +404,18 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     showStats = !showStats
                     text = if (showStats) "Stats on" else "Stats off"
-                    statsView.visibility = if (showStats) View.VISIBLE else View.GONE
-                    openGLRenderer?.gpuTimingEnabled = showStats
-                    openGLRenderer?.invalidateWarmup()
+                    applyRendererSettings()
                     sendSettings()
                 }
             })
 
             addView(Button(this@MainActivity).apply {
-                val currentTiming = openGLRenderer?.gpuTimingEnabled ?: true
-                text = if (currentTiming) "GPU Timing on" else "GPU Timing off"
+                text = if (gpuTimingEnabled) "GPU Timing on" else "GPU Timing off"
                 setOnClickListener {
-                    val renderer = openGLRenderer ?: return@setOnClickListener
-                    renderer.gpuTimingEnabled = !renderer.gpuTimingEnabled
-                    text = if (renderer.gpuTimingEnabled) "GPU Timing on" else "GPU Timing off"
-                    renderer.invalidateWarmup()
+                    gpuTimingEnabled = !gpuTimingEnabled
+                    text = if (gpuTimingEnabled) "GPU Timing on" else "GPU Timing off"
+                    applyRendererSettings()
+                    saveSettings()
                 }
             })
         }
