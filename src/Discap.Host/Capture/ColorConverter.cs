@@ -64,7 +64,7 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
         return;
 
     // Input is B8G8R8A8_UNorm. 
-    // In HLSL, float4.x = B, float4.y = G, float4.z = R, float4.w = A
+    // In HLSL sampling for B8G8R8A8_UNorm: .r = Blue, .g = Green, .b = Red, .a = Alpha
     float4 p00 = InputTexture[uint2(x, y)];
     float4 p10 = InputTexture[uint2(x + 1, y)];
     float4 p01 = InputTexture[uint2(x, y + 1)];
@@ -100,22 +100,31 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
         }
     }
 
-    // BT.601 limited range YUV conversion
-    float y00 = 0.257 * p00.r + 0.504 * p00.g + 0.098 * p00.b + 0.0625;
-    float y10 = 0.257 * p10.r + 0.504 * p10.g + 0.098 * p10.b + 0.0625;
-    float y01 = 0.257 * p01.r + 0.504 * p01.g + 0.098 * p01.b + 0.0625;
-    float y11 = 0.257 * p11.r + 0.504 * p11.g + 0.098 * p11.b + 0.0625;
+    // Extract true R, G, B components from B8G8R8A8_UNorm (.r = Blue, .g = Green, .b = Red)
+    float r00 = p00.b; float g00 = p00.g; float b00 = p00.r;
+    float r10 = p10.b; float g10 = p10.g; float b10 = p10.r;
+    float r01 = p01.b; float g01 = p01.g; float b01 = p01.r;
+    float r11 = p11.b; float g11 = p11.g; float b11 = p11.r;
 
-    OutputY[uint2(x, y)] = (uint)(y00 * 255.0);
-    OutputY[uint2(x + 1, y)] = (uint)(y10 * 255.0);
-    OutputY[uint2(x, y + 1)] = (uint)(y01 * 255.0);
-    OutputY[uint2(x + 1, y + 1)] = (uint)(y11 * 255.0);
+    // BT.709 Full Range (0-255 sRGB) YUV conversion
+    float y00 = saturate(0.2126 * r00 + 0.7152 * g00 + 0.0722 * b00);
+    float y10 = saturate(0.2126 * r10 + 0.7152 * g10 + 0.0722 * b10);
+    float y01 = saturate(0.2126 * r01 + 0.7152 * g01 + 0.0722 * b01);
+    float y11 = saturate(0.2126 * r11 + 0.7152 * g11 + 0.0722 * b11);
 
-    float4 avg = (p00 + p10 + p01 + p11) * 0.25;
-    float u = -0.148 * avg.r - 0.291 * avg.g + 0.439 * avg.b + 0.5;
-    float v = 0.439 * avg.r - 0.368 * avg.g - 0.071 * avg.b + 0.5;
+    OutputY[uint2(x, y)] = (uint)(y00 * 255.0 + 0.5);
+    OutputY[uint2(x + 1, y)] = (uint)(y10 * 255.0 + 0.5);
+    OutputY[uint2(x, y + 1)] = (uint)(y01 * 255.0 + 0.5);
+    OutputY[uint2(x + 1, y + 1)] = (uint)(y11 * 255.0 + 0.5);
 
-    OutputUV[DTid.xy] = uint2((uint)(u * 255.0), (uint)(v * 255.0));
+    float rAvg = (r00 + r10 + r01 + r11) * 0.25;
+    float gAvg = (g00 + g10 + g01 + g11) * 0.25;
+    float bAvg = (b00 + b10 + b01 + b11) * 0.25;
+
+    float u = saturate(-0.1146 * rAvg - 0.3854 * gAvg + 0.5000 * bAvg + 0.5);
+    float v = saturate( 0.5000 * rAvg - 0.4542 * gAvg - 0.0458 * bAvg + 0.5);
+
+    OutputUV[DTid.xy] = uint2((uint)(u * 255.0 + 0.5), (uint)(v * 255.0 + 0.5));
 }
 ";
 
