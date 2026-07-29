@@ -83,10 +83,12 @@ class UsbReceiver(
                 input.readFully(payloadBuffer, 0, compressedSize)
 
                 if (fTypeInt == 3) {
+                    Log.d("DISCAP-CURSOR", "📥 PACKET ARRIVED: Type 3, Size=$compressedSize")
                     val copy = payloadBuffer.copyOf(compressedSize)
                     cursorManager?.onCursorPosReceived(copy)
                     continue
                 } else if (fTypeInt == 4) {
+                    Log.d("DISCAP-CURSOR", "📥 SHAPE PACKET ARRIVED! Size=$compressedSize")
                     val copy = payloadBuffer.copyOf(compressedSize)
                     cursorManager?.onCursorShapeReceived(copy)
                     continue

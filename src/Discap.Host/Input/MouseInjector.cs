@@ -73,7 +73,6 @@ public static class MouseInjector
 
         // 4. Move mouse cursor onto the Virtual Display
         SetCursorPos(absoluteX, absoluteY);
-
         // 5. Handle Clicks
         bool isMouseDown = packet.Action == 1 || packet.Action == 2; // Down or Move
 

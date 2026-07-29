@@ -6,7 +6,7 @@ import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
 
-class H264Decoder(private val surface: Surface, var width: Int, var height: Int) {
+class H264Decoder(private val surface: Surface, var width: Int, var height: Int, var displayRefreshRateHz: Float = 144f) {
 
     var onResolutionDetected: ((width: Int, height: Int) -> Unit)? = null
     private var codec: MediaCodec? = null
@@ -98,60 +98,59 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
         }
     }
 
+    private data class DecodedFrame(
+        val index: Int,
+        val presentationTimeUs: Long,
+        val dequeueTimeNs: Long
+    )
+
+    private fun detectDisplayRefreshRate(): Float {
+        return if (displayRefreshRateHz > 0f) displayRefreshRateHz else 144f
+    }
+
     private fun drainOutput() {
         val bufferInfo = MediaCodec.BufferInfo()
+        val pendingQueue = java.util.ArrayDeque<DecodedFrame>()
+
+        val TARGET_BUFFER_DEPTH = 2
+        val MAX_BUFFER_DEPTH = 4
+
         var framesRendered = 0
         var framesDropped = 0
-        var totalDequeueMs = 0.0
+        var totalCadenceMs = 0.0
+        var cadenceSamples = 0
+        var totalQueueDepth = 0L
+        var depthSamples = 0L
+
+        var lastReleaseTimeNs = 0L
         var lastLogTime = System.currentTimeMillis()
+
+        // Fixed target release cadence derived strictly from the display panel refresh rate
+        val actualRefreshRate = detectDisplayRefreshRate()
+        val targetIntervalNs = (1_000_000_000L / actualRefreshRate.toDouble()).toLong()
+        val targetMs = targetIntervalNs / 1_000_000.0
+
+        Log.i("Discap.H264", "[DEC-PACING] Initialized steady-clock presentation buffer. Panel refresh rate: ${actualRefreshRate}Hz (constant target: ${String.format("%.2f", targetMs)}ms), target depth: $TARGET_BUFFER_DEPTH, max depth: $MAX_BUFFER_DEPTH")
 
         while (isRunning) {
             try {
                 val codec = codec ?: break
 
-                // Dequeue first available output buffer (10ms timeout)
+                // 1. Dequeue decoded output buffers from MediaCodec (non-blocking 1ms timeout)
                 val t0 = System.nanoTime()
-                var outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 10000)
-                val t1 = System.nanoTime()
+                val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 1000)
 
                 if (outputBufferIndex >= 0) {
-                    // Got a decoded frame. Now check if more are immediately available —
-                    // if so, this frame is stale and we should skip to the newest one.
-                    // This prevents BLASTBufferQueue overflow during post-idle bursts
-                    // where multiple frames arrive faster than the surface can consume.
-                    val nextInfo = MediaCodec.BufferInfo()
-                    var newestIndex = outputBufferIndex
+                    pendingQueue.addLast(DecodedFrame(outputBufferIndex, bufferInfo.presentationTimeUs, t0))
 
+                    // Drain any additional immediately available output buffers
                     while (true) {
-                        val nextIndex = codec.dequeueOutputBuffer(nextInfo, 0) // non-blocking
+                        val nextIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                         if (nextIndex >= 0) {
-                            // A newer frame is available — drop the older one without rendering
-                            codec.releaseOutputBuffer(newestIndex, false)
-                            framesDropped++
-                            newestIndex = nextIndex
+                            pendingQueue.addLast(DecodedFrame(nextIndex, bufferInfo.presentationTimeUs, System.nanoTime()))
                         } else {
                             break
                         }
-                    }
-
-                    // Render the newest frame immediately (true = render now).
-                    // We avoid scheduled renderTimestampNs because it holds buffers
-                    // in the BLASTBufferQueue waiting for their presentation time,
-                    // which causes "Can't acquire next buffer" overflow on bursts.
-                    codec.releaseOutputBuffer(newestIndex, true)
-
-                    val dequeueMs = (t1 - t0) / 1000000.0
-                    totalDequeueMs += dequeueMs
-                    framesRendered++
-
-                    val now = System.currentTimeMillis()
-                    if (now - lastLogTime >= 1000) {
-                        val avgDequeue = if (framesRendered > 0) totalDequeueMs / framesRendered else 0.0
-                        Log.i("Discap.H264", "[DEC-STATS] FPS: $framesRendered | Dropped: $framesDropped | Avg dequeue: ${String.format("%.2f", avgDequeue)}ms")
-                        framesRendered = 0
-                        framesDropped = 0
-                        totalDequeueMs = 0.0
-                        lastLogTime = now
                     }
                 } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     val newFormat = codec.outputFormat
@@ -160,10 +159,94 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
                     val fmtH = if (newFormat.containsKey(MediaFormat.KEY_HEIGHT)) newFormat.getInteger(MediaFormat.KEY_HEIGHT) else height
                     onResolutionDetected?.invoke(fmtW, fmtH)
                 }
+
+                // Track queue depth stats
+                totalQueueDepth += pendingQueue.size
+                depthSamples++
+
+                // 2. BACKLOG SAFETY NET: Overflow prevention fallback
+                // If queue depth exceeds MAX_BUFFER_DEPTH (e.g. 4 frames during unexpected spike),
+                // drop oldest frames until queue size <= TARGET_BUFFER_DEPTH
+                while (pendingQueue.size > MAX_BUFFER_DEPTH) {
+                    val oldestFrame = pendingQueue.removeFirst()
+                    codec.releaseOutputBuffer(oldestFrame.index, false) // Drop without rendering
+                    framesDropped++
+                    Log.w("Discap.H264", "[PACING-OVERFLOW] Queue depth (${pendingQueue.size + 1}) > max ($MAX_BUFFER_DEPTH). Dropped oldest frame (ts=${oldestFrame.presentationTimeUs}us).")
+                }
+
+                // 3. STEADY-CLOCK PACED PRESENTATION RELEASE
+                val nowNs = System.nanoTime()
+
+                // Dynamic catch-up acceleration: if network jitter accumulated > TARGET_BUFFER_DEPTH frames,
+                // accelerate release cadence 2x to rapidly restore low latency.
+                val effectiveReleaseInterval = if (pendingQueue.size > TARGET_BUFFER_DEPTH) targetIntervalNs / 2 else targetIntervalNs
+
+                val canRelease = if (lastReleaseTimeNs == 0L) {
+                    pendingQueue.size >= TARGET_BUFFER_DEPTH
+                } else {
+                    nowNs - lastReleaseTimeNs >= effectiveReleaseInterval
+                }
+
+                if (canRelease && !pendingQueue.isEmpty()) {
+                    val frameToRelease = pendingQueue.removeFirst()
+                    codec.releaseOutputBuffer(frameToRelease.index, true) // Render to Surface
+
+                    if (lastReleaseTimeNs > 0L) {
+                        val cadenceMs = (nowNs - lastReleaseTimeNs) / 1_000_000.0
+                        totalCadenceMs += cadenceMs
+                        cadenceSamples++
+                    }
+
+                    // Advance release schedule smoothly
+                    lastReleaseTimeNs = if (lastReleaseTimeNs == 0L || nowNs - lastReleaseTimeNs > targetIntervalNs * 2) {
+                        nowNs
+                    } else {
+                        lastReleaseTimeNs + effectiveReleaseInterval
+                    }
+                    framesRendered++
+                }
+
+                // 4. PERIODIC STATS LOGGING (every 1 second)
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastLogTime >= 1000) {
+                    val avgCadenceMs = if (cadenceSamples > 0) totalCadenceMs / cadenceSamples else 0.0
+                    val avgQueueDepth = if (depthSamples > 0) totalQueueDepth.toDouble() / depthSamples else 0.0
+
+                    Log.i("Discap.H264", "[DEC-PACING-STATS] Rendered: $framesRendered | Dropped: $framesDropped | Avg Release Cadence: ${String.format("%.2f", avgCadenceMs)}ms (Target Constant: ${String.format("%.2f", targetMs)}ms) | Avg Queue Depth: ${String.format("%.2f", avgQueueDepth)} | Current Queue: ${pendingQueue.size}")
+
+                    framesRendered = 0
+                    framesDropped = 0
+                    totalCadenceMs = 0.0
+                    cadenceSamples = 0
+                    totalQueueDepth = 0L
+                    depthSamples = 0L
+                    lastLogTime = nowMs
+                }
+
+                // Small sleep to prevent CPU spinning when waiting for next tick
+                if (pendingQueue.isEmpty()) {
+                    Thread.sleep(1)
+                } else {
+                    val sleepMs = ((lastReleaseTimeNs + targetIntervalNs - System.nanoTime()) / 1_000_000L).coerceIn(0L, 2L)
+                    if (sleepMs > 0) {
+                        Thread.sleep(sleepMs)
+                    }
+                }
+
             } catch (e: Exception) {
-                Log.e("Discap.H264", "Drain error: ${e.message}")
+                if (isRunning) {
+                    Log.e("Discap.H264", "Paced drain error: ${e.message}")
+                }
                 break
             }
+        }
+
+        // Clean up any remaining unrendered buffers in queue on stop
+        while (!pendingQueue.isEmpty()) {
+            try {
+                val f = pendingQueue.removeFirst()
+                codec?.releaseOutputBuffer(f.index, false)
+            } catch (e: Exception) {}
         }
     }
 

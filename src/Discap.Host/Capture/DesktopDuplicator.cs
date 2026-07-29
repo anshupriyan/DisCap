@@ -286,6 +286,8 @@ public sealed class DesktopDuplicator : IDisposable
 
             SetDefaultCursorShape();
 
+            SetDefaultCursorShape();
+
             Console.WriteLine("[CAP] Desktop Duplication initialized");
             return true;
         }
