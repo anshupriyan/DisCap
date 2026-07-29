@@ -69,7 +69,7 @@ public sealed class HardwareEncoder : IVideoEncoder
         return true;
     }
 
-    public unsafe bool OpenDevice(IntPtr d3d11DeviceHandle, string rcMode = "vbr")
+    public unsafe bool OpenDevice(IntPtr d3d11DeviceHandle, string rcMode = "cbr")
     {
         if (!_available) return false;
         _rcMode = rcMode;
@@ -128,10 +128,24 @@ public sealed class HardwareEncoder : IVideoEncoder
         initParams.EncodeConfig = &presetConfig.PresetCfg;
         ApplyRateControl(initParams.EncodeConfig, (uint)_bitrate, _rcMode, _targetQuality);
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
-        initParams.EncodeConfig->GopLength = 120;
+        initParams.EncodeConfig->RcParams.EnableLookahead = false;
+        initParams.EncodeConfig->RcParams.LookaheadDepth = 0;
+        initParams.EncodeConfig->GopLength = 0xFFFFFFFF; // NVENC_INFINITE_GOPLENGTH — required for intra-refresh
         initParams.EncodeConfig->FrameIntervalP = 1; // B-frames = 0
-        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 0xFFFFFFFF;
         initParams.EncodeConfig->EncodeCodecConfig.H264Config.RepeatSPSPPS = true;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.EnableIntraRefresh = true;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IntraRefreshPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IntraRefreshCnt = 8;
+
+        // VUI Parameters: Explicitly lock BT.709 Full Range (0-255 sRGB) metadata
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.VideoSignalTypePresentFlag = 1;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.VideoFormat = NvEncVuiVideoFormat.Component;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.VideoFullRangeFlag = 1; // 0-255 Full Range sRGB
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.ColourDescriptionPresentFlag = 1;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.ColourPrimaries = NvEncVuiColorPrimaries.Bt709;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.TransferCharacteristics = NvEncVuiTransferCharacteristic.Bt709;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.ColourMatrix = NvEncVuiMatrixCoeffs.Bt709;
 
         status = LibNvEnc.FunctionList.InitializeEncoder(_encoder, ref initParams);
         if (status != NvEncStatus.Success)
@@ -454,17 +468,31 @@ public sealed class HardwareEncoder : IVideoEncoder
         initParams.EncodeConfig = &presetConfig.PresetCfg;
         ApplyRateControl(initParams.EncodeConfig, (uint)_bitrate, _rcMode, _targetQuality);
         initParams.EncodeConfig->RcParams.ZeroReorderDelay = true;
-        initParams.EncodeConfig->GopLength = 120;
+        initParams.EncodeConfig->RcParams.EnableLookahead = false;
+        initParams.EncodeConfig->RcParams.LookaheadDepth = 0;
+        initParams.EncodeConfig->GopLength = 0xFFFFFFFF;
         initParams.EncodeConfig->FrameIntervalP = 1;
-        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IdrPeriod = 0xFFFFFFFF;
         initParams.EncodeConfig->EncodeCodecConfig.H264Config.RepeatSPSPPS = true;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.EnableIntraRefresh = true;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IntraRefreshPeriod = 120;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.IntraRefreshCnt = 8;
+
+        // VUI Parameters: Explicitly lock BT.709 Full Range (0-255 sRGB) metadata
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.VideoSignalTypePresentFlag = 1;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.VideoFormat = NvEncVuiVideoFormat.Component;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.VideoFullRangeFlag = 1; // 0-255 Full Range sRGB
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.ColourDescriptionPresentFlag = 1;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.ColourPrimaries = NvEncVuiColorPrimaries.Bt709;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.TransferCharacteristics = NvEncVuiTransferCharacteristic.Bt709;
+        initParams.EncodeConfig->EncodeCodecConfig.H264Config.H264VUIParameters.ColourMatrix = NvEncVuiMatrixCoeffs.Bt709;
 
         var reconfigParams = new NvEncReconfigureParams
         {
             Version = LibNvEnc.NV_ENC_RECONFIGURE_PARAMS_VER,
             ReInitEncodeParams = initParams,
-            ResetEncoder = true,
-            ForceIDR = true
+            ResetEncoder = false,
+            ForceIDR = false
         };
 
         status = LibNvEnc.FunctionList.ReconfigureEncoder(_encoder, ref reconfigParams);

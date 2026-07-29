@@ -14,10 +14,14 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
     @Volatile private var isRunning = false
     private var outputThread: Thread? = null
 
+    /** Flag set during active touch/scroll interactions to reduce target queue depth to 1 */
+    @Volatile var isTouchActive: Boolean = false
+
     fun start() {
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) // Critical for zero-latency decoding
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
             format.setInteger(MediaFormat.KEY_MAX_WIDTH, 3840)
             format.setInteger(MediaFormat.KEY_MAX_HEIGHT, 2160)
             
@@ -25,6 +29,20 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
             
             // Output directly to the Surface for zero-copy rendering
             codec?.configure(format, surface, null, 0)
+
+            // Surface frame rate hint for optimal VSYNC scheduling on Android 11+ (API 30+)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                try {
+                    surface.setFrameRate(
+                        displayRefreshRateHz,
+                        Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                        Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+                    )
+                } catch (e: Exception) {
+                    Log.w("Discap.H264", "Failed to set surface frame rate: ${e.message}")
+                }
+            }
+
             codec?.start()
             isConfigured = true
             isRunning = true
@@ -40,6 +58,16 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
 
     private var pendingCsdAfterFlush = false
 
+    fun flush() {
+        try {
+            codec?.flush()
+            pendingCsdAfterFlush = true
+            Log.i("Discap.H264", "[DEC] flushed MediaCodec pipeline")
+        } catch (e: Exception) {
+            Log.e("Discap.H264", "Failed to flush MediaCodec: ${e.message}")
+        }
+    }
+
     fun flush(newWidth: Int, newHeight: Int) {
         try {
             codec?.flush()
@@ -52,11 +80,11 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
         }
     }
 
-    fun decode(nalData: ByteArray, offset: Int, length: Int, timestampUs: Long) {
-        if (!isConfigured) return
-        val codec = codec ?: return
+    fun decode(nalData: ByteArray, offset: Int, length: Int, timestampUs: Long): Boolean {
+        if (!isConfigured) return false
+        val codec = codec ?: return false
 
-        // Parse NAL unit type
+        // Parse NAL unit type of first NAL in payload (for logging/CSD tracking)
         var nalType = -1
         var headerIndex = offset
         if (length >= 4) {
@@ -72,18 +100,18 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
             nalType = nalData[headerIndex].toInt() and 0x1F
         }
 
-        var flags = 0
-        if (pendingCsdAfterFlush) {
-            if (nalType == 7 || nalType == 8) {
-                flags = MediaCodec.BUFFER_FLAG_CODEC_CONFIG
-            } else if (nalType == 5) {
-                pendingCsdAfterFlush = false
-                Log.i("Discap.H264", "[DEC] CSD flush complete — IDR received, decoder reconfigured")
-            }
+        // Combined Annex-B payloads contain inline SPS/PPS/Slice with start codes.
+        // MediaCodec natively extracts inline Annex-B headers when flags = 0.
+        val flags = 0
+
+        // Clear CSD state on any valid frame (Intra-Refresh P-slice type 1 or IDR type 5)
+        if (pendingCsdAfterFlush && (nalType == 1 || nalType == 5)) {
+            pendingCsdAfterFlush = false
+            Log.i("Discap.H264", "[DEC] CSD flush complete — first frame received (nalType=$nalType)")
         }
 
-        try {
-            // 1. Feed NAL unit to decoder
+        return try {
+            // Feed Access Unit to decoder
             val inputBufferIndex = codec.dequeueInputBuffer(10000) // 10ms timeout
             if (inputBufferIndex >= 0) {
                 val inputBuffer: ByteBuffer? = codec.getInputBuffer(inputBufferIndex)
@@ -91,10 +119,16 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
                     inputBuffer.clear()
                     inputBuffer.put(nalData, offset, length)
                     codec.queueInputBuffer(inputBufferIndex, 0, length, timestampUs, flags)
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false // Codec busy, caller will retry this packet
             }
         } catch (e: Exception) {
             Log.e("Discap.H264", "Decode error: ${e.message}")
+            false
         }
     }
 
@@ -109,6 +143,7 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
     }
 
     private fun drainOutput() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         val bufferInfo = MediaCodec.BufferInfo()
         val pendingQueue = java.util.ArrayDeque<DecodedFrame>()
 
@@ -177,19 +212,24 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
                 // 3. STEADY-CLOCK PACED PRESENTATION RELEASE
                 val nowNs = System.nanoTime()
 
-                // Dynamic catch-up acceleration: if network jitter accumulated > TARGET_BUFFER_DEPTH frames,
+                // Dynamic target depth: 1 during active touch scrolling for minimum latency, 2 for static viewing cushion
+                val currentTargetDepth = if (isTouchActive) 1 else TARGET_BUFFER_DEPTH
+
+                // Dynamic catch-up acceleration: if network jitter accumulated > currentTargetDepth frames,
                 // accelerate release cadence 2x to rapidly restore low latency.
-                val effectiveReleaseInterval = if (pendingQueue.size > TARGET_BUFFER_DEPTH) targetIntervalNs / 2 else targetIntervalNs
+                val effectiveReleaseInterval = if (pendingQueue.size > currentTargetDepth) targetIntervalNs / 2 else targetIntervalNs
 
                 val canRelease = if (lastReleaseTimeNs == 0L) {
-                    pendingQueue.size >= TARGET_BUFFER_DEPTH
+                    pendingQueue.size >= currentTargetDepth
                 } else {
                     nowNs - lastReleaseTimeNs >= effectiveReleaseInterval
                 }
 
                 if (canRelease && !pendingQueue.isEmpty()) {
                     val frameToRelease = pendingQueue.removeFirst()
-                    codec.releaseOutputBuffer(frameToRelease.index, true) // Render to Surface
+                    // VSYNC-aligned release: System.nanoTime() + 1ms epsilon tells SurfaceFlinger to snap to the immediate next VSYNC boundary
+                    val targetVsyncNs = System.nanoTime() + 1_000_000L
+                    codec.releaseOutputBuffer(frameToRelease.index, targetVsyncNs)
 
                     if (lastReleaseTimeNs > 0L) {
                         val cadenceMs = (nowNs - lastReleaseTimeNs) / 1_000_000.0

@@ -9,6 +9,8 @@ import java.io.EOFException
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
 class SocketReceiver(
@@ -19,12 +21,17 @@ class SocketReceiver(
 ) {
 
     private var isRunning = false
-    private var thread: Thread? = null
+    private var networkThread: Thread? = null
+    private var decoderThread: Thread? = null
 
     private var h264Decoder: H264Decoder? = null
     private var lz4Decoder: Lz4Decoder? = null
 
     val sender = SocketSender()
+
+    fun setTouchActive(active: Boolean) {
+        h264Decoder?.isTouchActive = active
+    }
 
     data class FrameStats(
         val fps: Double,
@@ -32,6 +39,23 @@ class SocketReceiver(
         val latencyMs: Double,
         val encoderType: String
     )
+
+    /** NAL packet data class for the network→decoder queue */
+    data class NalPacket(
+        val frameType: Int,
+        val data: ByteArray,
+        val size: Int,
+        val width: Int,
+        val height: Int,
+        val timestampUs: Long
+    )
+
+    /** Lock-free queue between network thread and decoder thread */
+    private val nalQueue = ConcurrentLinkedQueue<NalPacket>()
+    private val queueDepth = AtomicInteger(0)
+
+    /** Soft cap for queue overflow detection — triggers flush + PLI */
+    private val QUEUE_OVERFLOW_THRESHOLD = 60
 
     // 32-byte header structure
     // 0..3   Magic "DCAP"
@@ -49,20 +73,29 @@ class SocketReceiver(
         if (isRunning) return
         isRunning = true
 
-        thread = Thread {
-            receiveLoop()
-        }.apply { start() }
+        networkThread = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            networkReceiveLoop()
+        }.apply {
+            name = "DisCap-NetRecv"
+            start()
+        }
     }
 
     fun stopReceiver() {
         isRunning = false
-        thread?.interrupt()
-        
+        networkThread?.interrupt()
+        decoderThread?.interrupt()
+
         h264Decoder?.release()
         lz4Decoder?.release()
     }
 
-    private fun receiveLoop() {
+    /**
+     * Network thread: reads from TCP socket as fast as possible, enqueues
+     * NAL packets to the lock-free queue. NEVER blocks on the decoder.
+     */
+    private fun networkReceiveLoop() {
         val headerBuffer = ByteArray(32)
         var payloadBuffer = ByteArray(2 * 1024 * 1024)
 
@@ -75,6 +108,9 @@ class SocketReceiver(
                 socket.receiveBufferSize = 2 * 1024 * 1024
                 sender.attachSocket(socket)
                 Log.i("Discap.Net", "Connected to host.")
+
+                // Start the decoder feeder thread for this connection
+                startDecoderThread()
 
                 val input = DataInputStream(socket.getInputStream())
                 var statsFrames = 0
@@ -135,25 +171,19 @@ class SocketReceiver(
                         cursorManager?.setDesktopSize(width, height)
                         onVideoSizeChanged?.invoke(width, height)
                     }
-                    
-                    Log.i("Discap.Net", "[RCV] Packet received: type=$frameType size=$compressedSize")
 
-                    // Route to appropriate decoder
-                    if (frameType.toInt() == 2) {
-                        // NVENC H.264
-                        if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
-                            h264Decoder?.release()
-                            h264Decoder = H264Decoder(surface, width, height)
-                            h264Decoder?.onResolutionDetected = onVideoSizeChanged
-                            h264Decoder?.start()
-                        }
-                        h264Decoder?.decode(payloadBuffer, 0, compressedSize, timestampUs)
-                    } else if (frameType.toInt() == 1) {
-                        // LZ4
-                        if (lz4Decoder == null || lz4Decoder!!.width != width || lz4Decoder!!.height != height) {
-                            lz4Decoder = Lz4Decoder(surface, width, height)
-                        }
-                        lz4Decoder?.decode(payloadBuffer, compressedSize, originalSize)
+                    // Enqueue to lock-free queue (ZERO blocking — network thread never waits)
+                    val nalCopy = payloadBuffer.copyOf(compressedSize)
+                    nalQueue.offer(NalPacket(fTypeInt, nalCopy, compressedSize, width, height, timestampUs))
+                    val depth = queueDepth.incrementAndGet()
+
+                    // Overflow detection: flush + PLI
+                    if (depth > QUEUE_OVERFLOW_THRESHOLD) {
+                        Log.w("Discap.Net", "[OVERFLOW] Frame queue depth ($depth) > threshold ($QUEUE_OVERFLOW_THRESHOLD). Flushing queue, resetting decoder, and requesting IDR.")
+                        nalQueue.clear()
+                        queueDepth.set(0)
+                        h264Decoder?.flush()
+                        sender.sendPliRequest()
                     }
 
                     if (timestampUs != lastTimestampUs) {
@@ -190,8 +220,83 @@ class SocketReceiver(
                 }
             } finally {
                 sender.detachSocket()
+                // Stop decoder thread for this connection
+                decoderThread?.interrupt()
+                decoderThread = null
+                nalQueue.clear()
+                queueDepth.set(0)
                 try { socket?.close() } catch (e: Exception) {}
             }
+        }
+    }
+
+    /**
+     * Decoder feeder thread: pulls frame packets from the lock-free queue
+     * and feeds them to the appropriate decoder. Uses Hold-and-Retry
+     * to guarantee ZERO frame drops when MediaCodec input buffers are busy.
+     */
+    private fun startDecoderThread() {
+        decoderThread?.interrupt()
+        decoderThread = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            Log.i("Discap.Net", "[DECODER-THREAD] Decoder feeder thread started.")
+
+            var pendingPacket: NalPacket? = null
+
+            while (isRunning && !Thread.currentThread().isInterrupted) {
+                try {
+                    if (pendingPacket == null) {
+                        pendingPacket = nalQueue.poll()
+                        if (pendingPacket != null) {
+                            queueDepth.decrementAndGet()
+                        }
+                    }
+
+                    val packet = pendingPacket
+                    if (packet != null) {
+                        val success = if (packet.frameType == 2) {
+                            // NVENC H.264
+                            if (h264Decoder == null || h264Decoder!!.width != packet.width || h264Decoder!!.height != packet.height) {
+                                h264Decoder?.release()
+                                h264Decoder = H264Decoder(surface, packet.width, packet.height)
+                                h264Decoder?.onResolutionDetected = onVideoSizeChanged
+                                h264Decoder?.start()
+                            }
+                            h264Decoder?.decode(packet.data, 0, packet.size, packet.timestampUs) ?: false
+                        } else if (packet.frameType == 1) {
+                            // LZ4
+                            if (lz4Decoder == null || lz4Decoder!!.width != packet.width || lz4Decoder!!.height != packet.height) {
+                                lz4Decoder = Lz4Decoder(surface, packet.width, packet.height)
+                            }
+                            lz4Decoder?.decode(packet.data, packet.size, packet.width * packet.height * 4)
+                            true
+                        } else {
+                            true
+                        }
+
+                        if (success) {
+                            pendingPacket = null // Successfully fed to decoder
+                        } else {
+                            // Codec busy — hold packet reference and retry on next loop tick
+                            Thread.sleep(1)
+                        }
+                    } else {
+                        // Queue empty — brief sleep to avoid busy-spinning
+                        Thread.sleep(1)
+                    }
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    if (isRunning) {
+                        Log.e("Discap.Net", "[DECODER-THREAD] Error: ${e.message}")
+                    }
+                }
+            }
+
+            Log.i("Discap.Net", "[DECODER-THREAD] Decoder feeder thread exiting.")
+        }.apply {
+            name = "DisCap-Decoder"
+            start()
         }
     }
 }

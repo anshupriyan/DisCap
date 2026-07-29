@@ -483,6 +483,9 @@ class MainActivity : Activity() {
         val button = if (action == 0.toByte()) 0.toByte() else 1.toByte()
         val pressure = (event.pressure * 255).toInt().toByte()
 
+        val isTouchActive = action == 1.toByte() || action == 2.toByte()
+        socketReceiver?.setTouchActive(isTouchActive)
+
         Log.d("DisCap.Touch", "Sending touch: xNorm=$xNorm, yNorm=$yNorm, action=$action")
         sender.sendInput(xNorm, yNorm, action, button, pressure)
         return true
