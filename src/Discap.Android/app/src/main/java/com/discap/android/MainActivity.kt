@@ -47,6 +47,8 @@ class MainActivity : Activity() {
     private var fpsCap = 0  // 0 = Native (no cap, matches display refresh rate)
     private var resolutionScale = 100
     private var encoderMode = ENCODER_AUTO
+    private var showStats = false
+    private var cqLevel = 28  // NVENC Target Quality (range 15-40, default 28)
     private var upscaleTargetTier = 200
     private var scaleModeOrdinal = OpenGLRenderer.ScaleMode.STRETCH.ordinal
     private var gpuTimingEnabled = true
