@@ -8,6 +8,7 @@ import java.nio.ByteBuffer
 
 class H264Decoder(private val surface: Surface, var width: Int, var height: Int) {
 
+    var onResolutionDetected: ((width: Int, height: Int) -> Unit)? = null
     private var codec: MediaCodec? = null
     private var isConfigured = false
     @Volatile private var isRunning = false
@@ -29,6 +30,7 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
             isRunning = true
             outputThread = Thread { drainOutput() }
             outputThread?.start()
+            onResolutionDetected?.invoke(width, height)
             Log.i("Discap.H264", "[DEC] MediaCodec configured: ${MediaFormat.MIMETYPE_VIDEO_AVC} ${width}x${height}")
         } catch (e: Exception) {
             Log.e("Discap.H264", "Failed to start MediaCodec: ${e.message}")
@@ -152,7 +154,11 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int)
                         lastLogTime = now
                     }
                 } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    Log.i("Discap.H264", "Output format changed: ${codec.outputFormat}")
+                    val newFormat = codec.outputFormat
+                    Log.i("Discap.H264", "Output format changed: $newFormat")
+                    val fmtW = if (newFormat.containsKey(MediaFormat.KEY_WIDTH)) newFormat.getInteger(MediaFormat.KEY_WIDTH) else width
+                    val fmtH = if (newFormat.containsKey(MediaFormat.KEY_HEIGHT)) newFormat.getInteger(MediaFormat.KEY_HEIGHT) else height
+                    onResolutionDetected?.invoke(fmtW, fmtH)
                 }
             } catch (e: Exception) {
                 Log.e("Discap.H264", "Drain error: ${e.message}")

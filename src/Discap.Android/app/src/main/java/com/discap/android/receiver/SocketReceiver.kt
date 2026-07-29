@@ -142,6 +142,7 @@ class SocketReceiver(
                         if (h264Decoder == null || h264Decoder!!.width != width || h264Decoder!!.height != height) {
                             h264Decoder?.release()
                             h264Decoder = H264Decoder(surface, width, height)
+                            h264Decoder?.onResolutionDetected = onVideoSizeChanged
                             h264Decoder?.start()
                         }
                         h264Decoder?.decode(payloadBuffer, 0, compressedSize, timestampUs)
