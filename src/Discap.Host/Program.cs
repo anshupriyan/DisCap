@@ -36,16 +36,11 @@ public static class Program
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern bool GetCursorPos(out Win32Point lpPoint);
 
-    [System.Runtime.InteropServices.DllImport("gdi32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
-    private static extern IntPtr CreateDC(string? lpszDriver, string lpszDevice, string? lpszOutput, IntPtr lpInitData);
+    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    public static extern uint TimeBeginPeriod(uint uMilliseconds);
 
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern bool BitBlt(IntPtr hdc, int nXDest, int nYDest, int nWidth, int nHeight, IntPtr hdcSrc, int nXSrc, int nYSrc, uint dwRop);
-
-    [System.Runtime.InteropServices.DllImport("gdi32.dll")]
-    private static extern bool DeleteDC(IntPtr hdc);
-
-    private const uint SRCCOPY = 0x00CC0020;
+    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    public static extern uint TimeEndPeriod(uint uMilliseconds);
 
     private static volatile bool _running = true;
 
@@ -65,6 +60,10 @@ public static class Program
 
         // Enable Per-Monitor DPI Awareness so Windows Win32 coordinate calls use physical pixels.
         MouseInjector.EnableDpiAwareness();
+
+        // Enable 1.0ms high-precision Windows OS timer resolution for smooth sub-millisecond pacing.
+        TimeBeginPeriod(1);
+        Console.WriteLine("[SYS] Set Windows OS timer resolution to 1.0ms (timeBeginPeriod).");
 
         // Parse configuration.
         var config = DiscapConfig.FromArgs(args);
@@ -378,7 +377,7 @@ public static class Program
             Console.WriteLine();
 
             // Spawn background task to read input events from the client
-            var inputTask = Task.Run(() => HandleInput(clientStream!, duplicator, streamSettings));
+            var inputTask = Task.Run(() => HandleInput(clientStream!, duplicator, streamSettings, encoder));
 
             // Reset counters for this session.
             sequenceNumber = 0;
@@ -407,6 +406,7 @@ public static class Program
             int lastSetQuality = -1;
             var dirtyRatioHistory = new Queue<float>();
             long lastReconfigureTicks = 0;
+            long lastRepeatFrameTicks = 0;
 
             // Idle resume & diagnostic metrics tracking
             long lastAcquireSuccessTicks = 0;
@@ -421,13 +421,9 @@ public static class Program
             long lastGpuKeepAliveTicks = 0;
             long gpuKeepAliveIntervalTicks = Stopwatch.Frequency / 2; // 500ms
 
-            long lastGdiKeepAliveMs = 0;
-            long lastKeepAliveLogMs = 0;
 
-            // Wake-Up Bitrate Ramping state
-            bool isWakingUp = false;
-            int wakeUpFramesRemaining = 0;
-            const int WAKE_UP_BITRATE_BPS = 3_000_000; // 3 Mbps warm-up bitrate
+
+
 
             var streamLock = new object();
             bool isClientConnected() => usbActive ? usbTransport.IsConnected : server.IsClientConnected;
@@ -531,6 +527,94 @@ public static class Program
                 }
             });
 
+            // ─── Single-Slot Atomic Frame Bundle & Send Worker ─────────
+            // Instead of a deep queue (which adds latency), we use a single
+            // slot that always holds the FRESHEST complete frame bundle.
+            // All NALs from one encode are grouped into one FrameBundle.
+            var sendSignal = new System.Threading.ManualResetEventSlim(false);
+            (PacketHeader Header, byte[] Payload)[]? _pendingFrame = null;
+
+            void EnqueueFrameBundle((PacketHeader Header, byte[] Payload)[] bundle)
+            {
+                System.Threading.Interlocked.Exchange(ref _pendingFrame, bundle);
+                sendSignal.Set();
+            }
+
+            var sendWorkerThread = new Thread(() =>
+            {
+                Console.WriteLine("[SEND-WORKER] Single-slot atomic send worker started.");
+                while (_running && isClientConnected())
+                {
+                    try
+                    {
+                        // Atomically grab the pending frame (and clear the slot)
+                        var frame = System.Threading.Interlocked.Exchange(ref _pendingFrame, null);
+                        if (frame != null)
+                        {
+                            if (clientStream == null || !clientStream.CanWrite) break;
+                            lock (streamLock)
+                            {
+                                long sendStartTicks = Stopwatch.GetTimestamp();
+                                try
+                                {
+                                    // Combine all NAL payloads in the bundle into a single Access Unit
+                                    int totalPayloadLength = 0;
+                                    foreach (var nal in frame) totalPayloadLength += nal.Payload.Length;
+
+                                    byte[] combinedPayload = new byte[totalPayloadLength];
+                                    int offset = 0;
+                                    foreach (var nal in frame)
+                                    {
+                                        Buffer.BlockCopy(nal.Payload, 0, combinedPayload, offset, nal.Payload.Length);
+                                        offset += nal.Payload.Length;
+                                    }
+
+                                    var firstHeader = frame[0].Header;
+                                    var combinedHeader = PacketHeader.Create(
+                                        firstHeader.FrameType,
+                                        firstHeader.Width,
+                                        firstHeader.Height,
+                                        firstHeader.OriginalSize,
+                                        (uint)totalPayloadLength,
+                                        firstHeader.Timestamp,
+                                        firstHeader.SequenceNumber,
+                                        firstHeader.Flags);
+
+                                    packetWriter.WritePacket(clientStream!, combinedHeader, combinedPayload, 0, combinedPayload.Length);
+                                    totalBytesSent += PacketHeader.SIZE + combinedPayload.Length;
+
+                                    long tSendEnd = Stopwatch.GetTimestamp();
+                                    double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
+                                    Console.WriteLine($"[TIMING] Send: {sendMs:F2}ms ({frame.Length} NALs, {totalPayloadLength} bytes)");
+                                    totalSendTicks += (tSendEnd - sendStartTicks);
+                                    nvencFrames++;
+                                }
+                                catch (Exception)
+                                {
+                                    Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // Nothing pending — wait for signal (timeout prevents permanent deadlock)
+                            sendSignal.Wait(50);
+                            sendSignal.Reset();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[SEND-WORKER] Error: {ex.Message}");
+                    }
+                }
+                Console.WriteLine("[SEND-WORKER] Worker thread exiting.");
+            });
+            sendWorkerThread.IsBackground = true;
+            sendWorkerThread.Name = "DisCap-SendWorker";
+            sendWorkerThread.Start();
+
+
             // ─── Capture loop ─────────────────────────────────────────
             while (_running && isClientConnected())
             {
@@ -572,35 +656,6 @@ public static class Program
                             nextFrameDueTicks += minFrameTicks;
                     }
 
-                    // ── 250ms Invisible GDI Keep-Alive (Prevents DXGI hardware sleep) ──
-                    long currentMs = Environment.TickCount64;
-                    if (currentMs - lastGdiKeepAliveMs >= 250)
-                    {
-                        lastGdiKeepAliveMs = currentMs;
-
-                        bool success = false;
-                        if (!string.IsNullOrEmpty(duplicator.DeviceName))
-                        {
-                            IntPtr hdc = CreateDC(null, duplicator.DeviceName, null, IntPtr.Zero);
-                            if (hdc != IntPtr.Zero)
-                            {
-                                int targetX = Math.Max(0, duplicator.Width - 4);
-                                int targetY = Math.Max(0, duplicator.Height - 4);
-                                success = BitBlt(hdc, targetX, targetY, 4, 4, hdc, targetX, targetY, SRCCOPY);
-                                DeleteDC(hdc);
-                            }
-                            else
-                            {
-                                Console.WriteLine($"[KEEP-ALIVE] FAILED: Could not get HDC for {duplicator.DeviceName}");
-                            }
-                        }
-
-                        if (currentMs - lastKeepAliveLogMs >= 1000)
-                        {
-                            lastKeepAliveLogMs = currentMs;
-                            Console.WriteLine($"[KEEP-ALIVE] BitBlt executed. Success: {success}");
-                        }
-                    }
 
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
@@ -619,24 +674,13 @@ public static class Program
                     long nowTicks = Stopwatch.GetTimestamp();
                     timeSinceLastAcquiredFrameMs = lastAcquireSuccessTicks == 0 ? 0 : (nowTicks - lastAcquireSuccessTicks) * 1000.0 / Stopwatch.Frequency;
 
-                    const double IDLE_GAP_THRESHOLD_MS = 500.0; // 500ms is a genuine idle pause; 50ms was too sensitive at 144fps
+                    const double IDLE_GAP_THRESHOLD_MS = 500.0;
 
                     if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
                     {
                         Console.WriteLine($"[IDLE-RESUME] Discarding first post-idle frame (gap={timeSinceLastAcquiredFrameMs:F1}ms) to ensure clean capture.");
                         lastAcquireSuccessTicks = nowTicks;
                         newFrame.Dispose();
-                        if (nvencAvailable)
-                        {
-                            isWakingUp = true;
-                            wakeUpFramesRemaining = 15;
-                            int effectiveFps = fpsCap > 0 ? fpsCap : duplicator.CurrentRefreshRate;
-                            Console.WriteLine($"[WAKE-UP-RAMP] Triggered: Reconfiguring NVENC to 3Mbps warm-up bitrate for 15 frames.");
-                            encoder.Reconfigure(WAKE_UP_BITRATE_BPS, effectiveFps, (byte)streamSettings.TargetQuality);
-                            encoder.ForceKeyFrame();
-                            lastSetBitrate = WAKE_UP_BITRATE_BPS;
-                            lastReconfigureTicks = Stopwatch.GetTimestamp();
-                        }
                         continue;
                     }
 
@@ -657,9 +701,24 @@ public static class Program
                 else
                 {
                     // Screen is static — timeout on AcquireNextFrame.
-                    // Graceful Wake-Up: Silently drop missed frame to prevent network/decoder clogging during GPU wake-up
-                    Console.WriteLine("[TIMEOUT] Skipping duplicate frame to prevent ramping tear.");
-                    continue;
+                    // Send a light 10 FPS keep-alive repeat frame (every 100ms) to keep MediaCodec active
+                    // without clogging the network socket or causing latency spikes on motion resume.
+                    long nowTicks = Stopwatch.GetTimestamp();
+                    bool shouldSendKeepAlive = (lastRepeatFrameTicks == 0) || 
+                        ((nowTicks - lastRepeatFrameTicks) * 1000.0 / Stopwatch.Frequency >= 100.0);
+
+                    if (lastFrame != null && shouldSendKeepAlive)
+                    {
+                        frame = lastFrame;
+                        isRepeatFrame = true;
+                        lastRepeatFrameTicks = nowTicks;
+                        Console.WriteLine($"[KEEP-ALIVE-REPEAT] Sending 10 FPS repeat frame to preserve connection without network bloat.");
+                    }
+                    else
+                    {
+                        Thread.Sleep(1);
+                        continue;
+                    }
                 }
 
                 // Increment frame counter if we are in the active diagnostic window
@@ -739,142 +798,72 @@ public static class Program
                     byte targetQuality = (byte)streamSettings.TargetQuality;
                     long currentTicks = Stopwatch.GetTimestamp();
 
-                    if (isWakingUp)
-                    {
-                        wakeUpFramesRemaining--;
-                        Console.WriteLine($"[WAKE-UP-RAMP] Encoding frame at 3Mbps warm-up bitrate ({wakeUpFramesRemaining} frames remaining)");
-                        if (wakeUpFramesRemaining <= 0)
-                        {
-                            isWakingUp = false;
-                            int normalBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
-                            Console.WriteLine($"[WAKE-UP-RAMP] Warm-up complete. Restoring target bitrate: {normalBitrate / 1_000_000}Mbps.");
-                            encoder.Reconfigure(normalBitrate, effectiveFps, targetQuality);
-                            lastSetBitrate = normalBitrate;
-                            lastSetFps = effectiveFps;
-                            lastSetQuality = targetQuality;
-                            lastReconfigureTicks = currentTicks;
-                        }
-                    }
-                    else
-                    {
-                        int targetBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
-                        bool canReconfigure = (lastReconfigureTicks == 0) || (currentTicks - lastReconfigureTicks >= 3 * Stopwatch.Frequency);
+                    int targetBitrate = GetTargetBitrate(streamSettings.BitrateMbps, avgDirtyRatio, config.MotionThreshold);
+                    bool canReconfigure = (lastReconfigureTicks == 0) || (currentTicks - lastReconfigureTicks >= 3 * Stopwatch.Frequency);
 
-                        if (canReconfigure && (lastSetBitrate == -1 || lastSetFps != effectiveFps || lastSetQuality != targetQuality || Math.Abs(targetBitrate - lastSetBitrate) > lastSetBitrate * 0.50))
+                    bool initialSetupTrigger = lastSetBitrate == -1;
+                    bool fpsChangeTrigger = lastSetFps != effectiveFps;
+                    bool qualityChangeTrigger = lastSetQuality != targetQuality;
+                    bool bitrateSwingTrigger = Math.Abs(targetBitrate - lastSetBitrate) > lastSetBitrate * 0.50;
+
+                        if (canReconfigure && (initialSetupTrigger || fpsChangeTrigger || qualityChangeTrigger || bitrateSwingTrigger))
                         {
+                            string reason = initialSetupTrigger ? "Initial Encoder Setup" :
+                                            fpsChangeTrigger ? $"FPS Cap Change (Old: {lastSetFps}, New: {effectiveFps})" :
+                                            qualityChangeTrigger ? $"CQ Target Quality Change (Old: {lastSetQuality}, New: {targetQuality})" :
+                                            $"Bitrate Swing >50% (Old: {lastSetBitrate / 1_000_000}Mbps, New: {targetBitrate / 1_000_000}Mbps, avgDirtyRatio: {avgDirtyRatio:F4}, threshold: {config.MotionThreshold:F4})";
+
+                            string ts = DateTime.Now.ToString("HH:mm:ss.fff");
+                            Console.WriteLine($"[RECONFIGURE-DIAG] [{ts}] RECONFIGURE TRIGGER: {reason} | TargetBitrate: {targetBitrate / 1_000_000}Mbps | ForceIDR: true");
                             encoder.Reconfigure(targetBitrate, effectiveFps, targetQuality);
                             lastSetBitrate = targetBitrate;
                             lastSetFps = effectiveFps;
                             lastSetQuality = targetQuality;
                             lastReconfigureTicks = currentTicks;
                         }
-                    }
                     Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
-                    long encodeSubmitStartTicks = Stopwatch.GetTimestamp();
                     encoder.SubmitFrame(frame);
                     Console.WriteLine($"[ENC] {loopIteration}: SubmitFrame returned");
 
                     bool sentAny = false;
-                    double encodeSubmitToCompleteMs = 0;
-                    
-                    // Wait up to 100ms for at least one NAL unit to arrive, then drain the queue of all immediately available NAL units.
-                    while (encoder.TryGetNextPacket(out compressedData, out compressedSize, sentAny ? 0 : 100))
+                    var nalBundle = new System.Collections.Generic.List<(PacketHeader Header, byte[] Payload)>();
+
+                    while (encoder.TryGetNextPacket(out compressedData, out compressedSize, sentAny ? 0 : 50))
                     {
-                        if (!sentAny)
-                        {
-                            long encodeCompleteTicks = Stopwatch.GetTimestamp();
-                            encodeSubmitToCompleteMs = (encodeCompleteTicks - encodeSubmitStartTicks) * 1000.0 / Stopwatch.Frequency;
-                        }
                         sentAny = true;
                         nalCounter++;
 
-                        if (resumeTimeTicks != 0)
-                        {
-                            double msSinceResume = (Stopwatch.GetTimestamp() - resumeTimeTicks) * 1000.0 / Stopwatch.Frequency;
-                            if (msSinceResume <= 3000.0)
-                            {
-                                int nalType = 0;
-                                if (encoder is HardwareEncoder hw)
-                                {
-                                    nalType = hw.LastNalType;
-                                }
-                                Console.WriteLine($"[DIAG] idle→motion frame #{postIdleFrameCount}: size={compressedSize}B, dirtyArea={frame.TotalDirtyArea}, dirtyRatio={dirtyRatio * 100:F4}%, nalType={nalType}, timeSinceResume={msSinceResume:F1}ms");
-                            }
-                        }
-                        
-                        lock (streamLock)
-                        {
-                            long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                            long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-                            int originalSize = frame.Width * frame.Height * 4;
-                            uint seq = sequenceNumber++;
-                            ushort flags = seq == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
+                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+                        uint seq = sequenceNumber++;
+                        ushort flags = seq == 0 ? PacketHeader.FLAG_KEYFRAME : (ushort)0;
 
-                            var header = PacketHeader.Create(
-                                frameType,
-                                (ushort)frame.Width,
-                                (ushort)frame.Height,
-                                (uint)originalSize,
-                                (uint)compressedSize,
-                                elapsedUs,
-                                seq,
-                                flags);
+                        var header = PacketHeader.Create(
+                            FrameType.NVENC,
+                            (ushort)duplicator.Width,
+                            (ushort)duplicator.Height,
+                            (uint)(duplicator.Width * duplicator.Height * 4),
+                            (uint)compressedSize,
+                            elapsedUs,
+                            seq,
+                            flags);
 
-                            long sendStartTicks = Stopwatch.GetTimestamp();
-                            try
-                            {
-                                Console.WriteLine($"[NET] Sending packet: magic=DCAP type={(int)header.FrameType} size={compressedSize}");
-                                packetWriter.WritePacket(clientStream!, header, compressedData, 0, compressedSize);
-                                long tSendEnd = Stopwatch.GetTimestamp();
-                                
-                                double encodeMs = (sendStartTicks - encodeStartTicks) * 1000.0 / Stopwatch.Frequency;
-                                double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
-                                
-                                Console.WriteLine($"[TIMING] Capture: {frame.CaptureTimeMs:F2}ms | Convert: {frame.ConvertTimeMs:F2}ms | Readback: {frame.ReadbackTimeMs:F2}ms | Encode(SubmitToComplete): {encodeSubmitToCompleteMs:F2}ms | Send: {sendMs:F2}ms");
-
-                                totalBytesSent += PacketHeader.SIZE + compressedSize;
-                                totalSendTicks += (tSendEnd - sendStartTicks);
-                            }
-                            catch (Exception)
-                            {
-                                Console.Error.WriteLine("[STREAM] Write failed — client disconnected");
-                                break;
-                            }
-                        }
+                        byte[] nalCopy = new byte[compressedSize];
+                        Array.Copy(compressedData, nalCopy, compressedSize);
+                        nalBundle.Add((header, nalCopy));
                     }
 
-                    if (!sentAny) droppedFrames++;
-                    else
+                    if (nalBundle.Count > 0)
                     {
-                        nvencFrames++;
-                        if (!isIdleResumeFrame && !isRepeatFrame)
-                        {
-                            steadySampleCount++;
-                            double alpha = steadySampleCount < 20 ? 1.0 / steadySampleCount : 0.05;
-                            steadyAcquireMs += (frame.AcquireTimeMs - steadyAcquireMs) * alpha;
-                            steadyReadbackMs += (frame.ReadbackTimeMs - steadyReadbackMs) * alpha;
-                            steadyEncodeMs += (encodeSubmitToCompleteMs - steadyEncodeMs) * alpha;
-                            steadyAccumulatedFrames += (frame.AccumulatedFrames - steadyAccumulatedFrames) * alpha;
-                        }
-
-                        if (isIdleResumeFrame && !isRepeatFrame)
-                        {
-                            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-                            Console.WriteLine("[IDLE-RESUME-DIAG] ════════════════════════════════════════════════════════════════");
-                            Console.WriteLine($"[IDLE-RESUME-DIAG] First frame acquired after idle gap of {timeSinceLastAcquiredFrameMs:F1}ms at {timestamp}:");
-                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • DXGI AccumulatedFrames : {frame.AccumulatedFrames} (Steady-state avg: {steadyAccumulatedFrames:F2})");
-                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • AcquireNextFrame Time  : {frame.AcquireTimeMs:F2}ms (Steady-state avg: {steadyAcquireMs:F2}ms)");
-                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • GPU Readback/Copy Time : {frame.ReadbackTimeMs:F2}ms (Steady-state avg: {steadyReadbackMs:F2}ms)");
-                            Console.WriteLine($"[IDLE-RESUME-DIAG]   • NVENC Submit-to-Complete: {encodeSubmitToCompleteMs:F2}ms (Steady-state avg: {steadyEncodeMs:F2}ms)");
-                            Console.WriteLine("[IDLE-RESUME-DIAG] ════════════════════════════════════════════════════════════════");
-                        }
+                        EnqueueFrameBundle(nalBundle.ToArray());
                     }
-                    
+
+
                     long encodeTicks = Stopwatch.GetTimestamp() - encodeStartTicks;
                     totalEncodeTicks += encodeTicks;
                     
                     fpsCounter++;
-                    continue; // Skip the LZ4 packet sending logic below
+                    continue; // NALs enqueued to sendQueue, sendWorkerThread handles network transport
                 }
                 
                 // Fallback to LZ4
@@ -988,6 +977,7 @@ public static class Program
 
         // ─── Clean shutdown ───────────────────────────────────────────
         encoder.Dispose();
+        TimeEndPeriod(1);
         Console.WriteLine();
         Console.WriteLine("═══ Shutting down ═══");
         cts.Cancel();
@@ -1001,11 +991,10 @@ public static class Program
         {
             return 150_000_000; // Uncapped (Safety ceiling of 150 Mbps)
         }
-        int requested = Math.Clamp(requestedMbps, 5, 100) * 1_000_000;
-        return dirtyRatio >= motionThreshold ? requested : Math.Min(requested, 20_000_000);
+        return Math.Clamp(requestedMbps, 5, 100) * 1_000_000;
     }
 
-    private static void HandleInput(Stream stream, DesktopDuplicator duplicator, StreamSettings settings)
+    private static void HandleInput(Stream stream, DesktopDuplicator duplicator, StreamSettings settings, IVideoEncoder? encoder)
     {
         byte[] buffer = new byte[InputPacket.SIZE];
         try
@@ -1013,6 +1002,8 @@ public static class Program
             while (true)
             {
                 stream.ReadExactly(buffer, 0, InputPacket.SIZE);
+                uint magic = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+
                 if (InputPacket.TryReadFrom(buffer, out var packet))
                 {
                     MouseInjector.ProcessInput(packet, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height);
@@ -1021,6 +1012,11 @@ public static class Program
                 {
                     settings.Update(control);
                     Console.WriteLine($"\n[CFG] Client settings: {settings.BitrateMbps}Mbps, {settings.FpsCap}fps, {settings.ResolutionScale}%, mode={settings.EncoderMode}, stats={settings.ShowStats}, quality={settings.TargetQuality}");
+                }
+                else if (magic == 0x52494C50) // "PLIR" (0x52494C50 in little endian) — Picture Loss Indication (Request IDR)
+                {
+                    Console.WriteLine("\n[PLI] Received IDR request from Android client — forcing keyframe.");
+                    encoder?.ForceKeyFrame();
                 }
             }
         }

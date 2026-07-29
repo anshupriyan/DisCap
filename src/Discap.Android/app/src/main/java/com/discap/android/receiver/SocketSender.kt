@@ -107,4 +107,27 @@ class SocketSender {
             }
         }.start()
     }
+
+    /**
+     * Sends a PLI (Picture Loss Indication) control packet to the host.
+     * This requests the host to emit a ForceKeyFrame (IDR) for stream recovery.
+     * Uses magic "PLIR" (0x52494C50) — 12 bytes to match the standard packet size.
+     */
+    fun sendPliRequest() {
+        if (outputStream == null) return
+        val buffer = ByteArray(12)
+        val bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN)
+        bb.putInt(0x52494C50) // "PLIR" in little-endian
+        // Remaining 8 bytes are zero (reserved)
+
+        Thread {
+            try {
+                writePacket(buffer)
+                Log.i("Discap.Input", "[PLI] Sent IDR request to host")
+            } catch (e: Exception) {
+                Log.e("Discap.Input", "Failed to send PLI request: ${e.message}")
+                outputStream = null
+            }
+        }.start()
+    }
 }

@@ -84,7 +84,7 @@ public sealed class DiscapConfig
     /// cbr: Constant bitrate — eliminates QP hunting, steady stream.
     /// vbr-hq: VBR with two-pass quarter-resolution lookahead for better quality.
     /// </summary>
-    public string RcMode { get; set; } = "vbr";
+    public string RcMode { get; set; } = "cbr";
 
     /// <summary>
     /// Parse command-line arguments into a DiscapConfig.
