@@ -46,14 +46,6 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         val hotspotY = bb.getInt(20)
         val bufferSize = bb.getInt(24)
 
-        if (type == 1) {
-            Log.i("Discap.Cursor", "Shape updated: Type $type (Using fallback)")
-            mainHandler.post {
-                overlayView.updateShape(null, 0, 0)
-            }
-            return
-        }
-
         if (width <= 0 || height <= 0 || bufferSize <= 0 || payload.size < 28 + bufferSize) {
             return
         }
@@ -63,6 +55,7 @@ class CursorManager(private val overlayView: CursorOverlayView) {
 
         var bitmap: Bitmap? = try {
             when (type) {
+                1 -> decodeMonochromeBitmap(width, height, pitch, shapeBuffer) // TYPE_MONOCHROME
                 2 -> decodeColorBitmap(width, height, shapeBuffer)            // TYPE_COLOR
                 4 -> decodeMaskedColorBitmap(width, height, pitch, shapeBuffer) // TYPE_MASKED_COLOR
                 0 -> {
@@ -163,6 +156,72 @@ class CursorManager(private val overlayView: CursorOverlayView) {
         }
 
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun decodeMonochromeBitmap(
+        width: Int,
+        height: Int,
+        pitch: Int,
+        buffer: ByteArray
+    ): Bitmap {
+        val actualHeight = height / 2
+        if (width <= 0 || actualHeight <= 0) {
+            return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        }
+        val rawPixels = IntArray(width * actualHeight)
+        val rowPitch = if (pitch > 0) pitch else ((width + 31) / 32) * 4
+        val xorOffset = actualHeight * rowPitch
+
+        for (y in 0 until actualHeight) {
+            val andRowOffset = y * rowPitch
+            val xorRowOffset = xorOffset + y * rowPitch
+
+            for (x in 0 until width) {
+                val pixelIndex = y * width + x
+                val byteIdx = x / 8
+                val bitShift = 7 - (x % 8)
+
+                val andBytePos = andRowOffset + byteIdx
+                val xorBytePos = xorRowOffset + byteIdx
+
+                val andBit = if (andBytePos < buffer.size) {
+                    (buffer[andBytePos].toInt() ushr bitShift) and 1
+                } else 1
+
+                val xorBit = if (xorBytePos < buffer.size) {
+                    (buffer[xorBytePos].toInt() ushr bitShift) and 1
+                } else 0
+
+                val color = when {
+                    andBit == 0 && xorBit == 0 -> 0xFF000000.toInt() // Black border
+                    andBit == 0 && xorBit == 1 -> 0xFFFFFFFF.toInt() // White
+                    andBit == 1 && xorBit == 1 -> 0xFFFFFFFF.toInt() // Inverted / White body
+                    else -> 0x00000000                               // Transparent
+                }
+                rawPixels[pixelIndex] = color
+            }
+        }
+
+        // Bolding pass: expand white body & black outline by 1px horizontally for thin cursors like I-beam
+        val boldPixels = IntArray(width * actualHeight)
+        for (y in 0 until actualHeight) {
+            for (x in 0 until width) {
+                val idx = y * width + x
+                var color = rawPixels[idx]
+                if (color == 0x00000000) {
+                    val left = if (x > 0) rawPixels[idx - 1] else 0
+                    val right = if (x < width - 1) rawPixels[idx + 1] else 0
+                    if (left == 0xFFFFFFFF.toInt() || right == 0xFFFFFFFF.toInt()) {
+                        color = 0xFFFFFFFF.toInt() // Bold white body
+                    } else if (left == 0xFF000000.toInt() || right == 0xFF000000.toInt()) {
+                        color = 0xFF000000.toInt() // Bold black outline
+                    }
+                }
+                boldPixels[idx] = color
+            }
+        }
+
+        return Bitmap.createBitmap(boldPixels, width, actualHeight, Bitmap.Config.ARGB_8888)
     }
 
     private fun isBitmapEmpty(bitmap: Bitmap): Boolean {

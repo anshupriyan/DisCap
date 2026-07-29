@@ -17,6 +17,8 @@ import java.nio.FloatBuffer
  * 1. Zero-copy MediaCodec hardware video texture binding (GL_TEXTURE_EXTERNAL_OES).
  * 2. Real-time AMD Contrast Adaptive Sharpening (CAS) fragment shader.
  * 3. Dynamic viewport hardware upscaling from stream resolution up to device native screen peak.
+ * 4. Intermediate FBO for two-pass upscale pipeline (EASU/GSR → RCAS).
+ * 5. EXT_disjoint_timer_query GPU frame-time instrumentation (non-stalling).
  */
 class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
 
@@ -39,6 +41,9 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
     var streamHeight: Int = 1080
     var targetViewportWidth: Int = 0
     var targetViewportHeight: Int = 0
+
+    enum class ScaleMode { FIT, FILL, STRETCH }
+    var scaleMode: ScaleMode = ScaleMode.STRETCH
 
     private var programId: Int = 0
     private var aPositionHandle: Int = 0
@@ -69,6 +74,29 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         0.0f, 1.0f,
         1.0f, 1.0f
     )
+
+    // ─── Intermediate FBO for two-pass upscale pipeline ───
+    private var fboId: Int = 0
+    private var fboTextureId: Int = 0
+    private var fboWidth: Int = 0
+    private var fboHeight: Int = 0
+
+    // ─── EXT_disjoint_timer_query GPU timing ───
+    private var timerQuerySupported = false
+    private var timerQueryInitialized = false
+    private val queryIds = IntArray(2)        // Double-buffered: write to [writeIdx], read from [readIdx]
+    private var queryWriteIdx = 0
+    private var queryPending = BooleanArray(2) // Whether each query slot has a pending result
+    private var warmupFramesRemaining = 0      // Frames to discard after pipeline state change
+
+    /** Latest GPU frame time in milliseconds, or -1.0 if unavailable. */
+    var lastGpuFrameTimeMs: Double = -1.0
+        private set
+
+    /** Whether GPU timing instrumentation is active. */
+    var gpuTimingEnabled: Boolean = true
+
+    // ─── EXT_disjoint_timer_query instrumentation ───
 
     init {
         Matrix.setIdentityM(mvpMatrix, 0)
@@ -105,6 +133,7 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         surface = Surface(surfaceTexture)
 
         createProgram()
+        initTimerQuery()
         Log.i("DisCap-GL", "[GL] OpenGL ES 3.0 AMD CAS Renderer initialized (${streamWidth}x${streamHeight}) with OES texture #$oesTextureId")
     }
 
@@ -112,6 +141,7 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         if (width > 0 && height > 0 && (streamWidth != width || streamHeight != height)) {
             streamWidth = width
             streamHeight = height
+            invalidateWarmup()
             Log.i("DisCap-GL", "[GL] Updated stream resolution to ${width}x${height}")
         }
     }
@@ -124,29 +154,219 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
     }
 
     fun updateTexture() {
-        if (frameAvailable) {
-            try {
-                surfaceTexture?.updateTexImage()
-                surfaceTexture?.getTransformMatrix(stMatrix)
-                frameAvailable = false
-                hasTextureUpdated = true
-            } catch (e: Exception) {
-                Log.e("DisCap-GL", "[GL] updateTexImage failed: ${e.message}")
-            }
+        val st = surfaceTexture ?: return
+        try {
+            st.updateTexImage()
+            st.getTransformMatrix(stMatrix)
+            hasTextureUpdated = true
+            frameAvailable = false
+        } catch (e: Exception) {
+            // Expected if no new image frame is available on this GL tick yet
         }
     }
 
+    // ─── FBO lifecycle management ───
+
+    /**
+     * Ensures the intermediate FBO exists and matches the requested target dimensions.
+     * Called at the top of drawFrame() — a single reallocation checkpoint.
+     * Lazy: does nothing if targetW/targetH are 0 (no upscale pass needed).
+     */
+    private fun ensureFbo(requestedW: Int, requestedH: Int) {
+        if (requestedW <= 0 || requestedH <= 0) return
+        if (fboId != 0 && fboWidth == requestedW && fboHeight == requestedH) return
+
+        // Tear down old FBO if it exists with mismatched size
+        releaseFbo()
+
+        // Allocate new FBO
+        val fbos = IntArray(1)
+        GLES30.glGenFramebuffers(1, fbos, 0)
+        fboId = fbos[0]
+
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        fboTextureId = textures[0]
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fboTextureId)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8,
+            requestedW, requestedH, 0,
+            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboId)
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D, fboTextureId, 0
+        )
+
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            Log.e("DisCap-GL", "[FBO] Framebuffer incomplete! Status: 0x${Integer.toHexString(status)}")
+            releaseFbo()
+        } else {
+            fboWidth = requestedW
+            fboHeight = requestedH
+            Log.i("DisCap-GL", "[FBO] Allocated intermediate FBO ${requestedW}x${requestedH} (texture #$fboTextureId)")
+        }
+
+        // Unbind — drawFrame() will bind as needed
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+    }
+
+    private fun releaseFbo() {
+        if (fboTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(fboTextureId), 0)
+            fboTextureId = 0
+        }
+        if (fboId != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
+            fboId = 0
+        }
+        fboWidth = 0
+        fboHeight = 0
+    }
+
+    // ─── EXT_disjoint_timer_query instrumentation ───
+
+    private fun initTimerQuery() {
+        if (timerQueryInitialized) return
+        timerQueryInitialized = true
+
+        val extensions = GLES30.glGetString(GLES30.GL_EXTENSIONS) ?: ""
+        timerQuerySupported = extensions.contains("timer_query", ignoreCase = true)
+
+        if (timerQuerySupported) {
+            GLES30.glGenQueries(2, queryIds, 0)
+            queryPending[0] = false
+            queryPending[1] = false
+            Log.i("DisCap-GL", "[TIMER] GPU timer query supported. Query IDs: ${queryIds[0]}, ${queryIds[1]}")
+        } else {
+            Log.w("DisCap-GL", "[TIMER] GPU timer query NOT supported on this device. Extensions: $extensions")
+        }
+    }
+
+    /**
+     * Mark the start of a warm-up period. Called after any pipeline state change
+     * (shader switch, resolution change, upscale target change) so the first
+     * ~20 frames are discarded from timing measurements.
+     */
+    fun invalidateWarmup() {
+        warmupFramesRemaining = WARMUP_FRAME_COUNT
+    }
+
+    /**
+     * Begin a GPU timer query for this frame. Called at the top of the render pass.
+     * Uses double-buffered queries: write slot alternates each frame so we never
+     * read from the query we just wrote to (avoids pipeline stalls).
+     */
+    private fun beginGpuTimer() {
+        if (!gpuTimingEnabled || !timerQuerySupported) return
+        if (warmupFramesRemaining > 0) return // Don't measure during warm-up
+
+        // Before starting a new query on write slot, try to harvest the result
+        // from the OTHER slot (the one we wrote to 2 frames ago)
+        harvestGpuTimer()
+
+        val writeId = queryIds[queryWriteIdx]
+        GLES30.glBeginQuery(GL_TIME_ELAPSED_EXT, writeId)
+    }
+
+    /**
+     * End the GPU timer query for this frame. Called after all draw calls.
+     */
+    private fun endGpuTimer() {
+        if (!gpuTimingEnabled || !timerQuerySupported) return
+        if (warmupFramesRemaining > 0) {
+            warmupFramesRemaining--
+            return
+        }
+
+        GLES30.glEndQuery(GL_TIME_ELAPSED_EXT)
+        queryPending[queryWriteIdx] = true
+        queryWriteIdx = 1 - queryWriteIdx // Flip write slot
+    }
+
+    /**
+     * Non-blocking harvest of the oldest pending GPU timer result.
+     * Reads from the slot opposite to the current write slot.
+     * Checks result availability first — never stalls the CPU.
+     */
+    private fun harvestGpuTimer() {
+        if (!timerQuerySupported) return
+
+        val readIdx = 1 - queryWriteIdx
+        if (!queryPending[readIdx]) return
+
+        // Check for disjoint event (GPU context switch / thermal throttle / etc.)
+        // If disjoint occurred, all pending timer results are unreliable.
+        val disjoint = IntArray(1)
+        GLES30.glGetIntegerv(GL_GPU_DISJOINT_EXT, disjoint, 0)
+        if (disjoint[0] != 0) {
+            // Discard all pending results
+            queryPending[0] = false
+            queryPending[1] = false
+            lastGpuFrameTimeMs = -1.0
+            Log.d("DisCap-GL", "[TIMER] GPU disjoint event — discarding timer results")
+            return
+        }
+
+        // Non-blocking check: is the result available yet?
+        val available = IntArray(1)
+        GLES30.glGetQueryObjectuiv(queryIds[readIdx], GL_QUERY_RESULT_AVAILABLE_EXT, available, 0)
+        if (available[0] == 0) return // Not ready yet — don't stall, try next frame
+
+        // Read the result (nanoseconds)
+        val resultNs = IntArray(1)
+        GLES30.glGetQueryObjectuiv(queryIds[readIdx], GL_QUERY_RESULT_EXT, resultNs, 0)
+        queryPending[readIdx] = false
+
+        // Convert to unsigned long (GL returns uint, Java int is signed)
+        val ns = resultNs[0].toLong() and 0xFFFFFFFFL
+        lastGpuFrameTimeMs = ns / 1_000_000.0
+
+        if (lastGpuFrameTimeMs > 0.01) { // Only log non-trivial measurements
+            Log.d("DisCap-GL", "[TIMER] GPU frame time: ${"%.2f".format(lastGpuFrameTimeMs)} ms")
+        }
+    }
+
+    private fun releaseTimerQueries() {
+        if (timerQuerySupported && timerQueryInitialized) {
+            GLES30.glDeleteQueries(2, queryIds, 0)
+        }
+    }
+
+    // ─── Draw frame ───
+
     fun drawFrame(screenWidth: Int, screenHeight: Int) {
+        val t0 = System.nanoTime()
         updateTexture()
+
+        // FBO reallocation check — single checkpoint at top of drawFrame().
+        // Compare requested upscale target against current FBO attached texture size.
+        val requestedFboW = if (targetViewportWidth > 0) targetViewportWidth else 0
+        val requestedFboH = if (targetViewportHeight > 0) targetViewportHeight else 0
+        if (requestedFboW > 0 && requestedFboH > 0) {
+            ensureFbo(requestedFboW, requestedFboH)
+        }
 
         GLES30.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
 
         if (programId == 0 || !hasTextureUpdated) return
 
+        // ── Begin GPU timer ──
+        beginGpuTimer()
+
         GLES30.glUseProgram(programId)
 
-        // Calculate aspect-ratio fit within target viewport or screen
+        // Calculate viewport dimensions based on scale mode
         val targetW = if (targetViewportWidth > 0) targetViewportWidth else screenWidth
         val targetH = if (targetViewportHeight > 0) targetViewportHeight else screenHeight
 
@@ -156,18 +376,51 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         val videoRatio = videoW.toFloat() / videoH.toFloat()
         val targetRatio = targetW.toFloat() / targetH.toFloat()
 
-        val renderW: Int
-        val renderH: Int
-        if (videoRatio > targetRatio) {
-            renderW = targetW
-            renderH = (targetW / videoRatio).toInt()
-        } else {
-            renderH = targetH
-            renderW = (targetH * videoRatio).toInt()
+        var renderW: Int
+        var renderH: Int
+        var offsetX: Int
+        var offsetY: Int
+        var useScissor = false
+
+        when (scaleMode) {
+            ScaleMode.FIT -> {
+                // Min-covering: letterbox/pillarbox, black bars on shorter dimension
+                if (videoRatio > targetRatio) {
+                    renderW = targetW
+                    renderH = (targetW / videoRatio).toInt()
+                } else {
+                    renderH = targetH
+                    renderW = (targetH * videoRatio).toInt()
+                }
+                offsetX = (screenWidth - renderW) / 2
+                offsetY = (screenHeight - renderH) / 2
+            }
+            ScaleMode.FILL -> {
+                // Max-covering: overflow + crop via scissor, no black bars
+                if (videoRatio > targetRatio) {
+                    renderH = screenHeight
+                    renderW = (screenHeight * videoRatio).toInt()
+                } else {
+                    renderW = screenWidth
+                    renderH = (screenWidth / videoRatio).toInt()
+                }
+                offsetX = (screenWidth - renderW) / 2
+                offsetY = (screenHeight - renderH) / 2
+                useScissor = true
+            }
+            ScaleMode.STRETCH -> {
+                // Ignore aspect ratio, fill entire screen
+                renderW = screenWidth
+                renderH = screenHeight
+                offsetX = 0
+                offsetY = 0
+            }
         }
 
-        val offsetX = (screenWidth - renderW) / 2
-        val offsetY = (screenHeight - renderH) / 2
+        if (useScissor) {
+            GLES30.glEnable(GLES30.GL_SCISSOR_TEST)
+            GLES30.glScissor(0, 0, screenWidth, screenHeight)
+        }
 
         GLES30.glViewport(offsetX, offsetY, renderW, renderH)
 
@@ -189,6 +442,19 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
 
         GLES30.glDisableVertexAttribArray(aPositionHandle)
         GLES30.glDisableVertexAttribArray(aTexCoordHandle)
+
+        if (useScissor) {
+            GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
+        }
+
+        // ── End GPU timer ──
+        endGpuTimer()
+
+        val t1 = System.nanoTime()
+        val elapsedMs = (t1 - t0) / 1_000_000.0
+        if (!timerQuerySupported || lastGpuFrameTimeMs <= 0.0) {
+            lastGpuFrameTimeMs = if (lastGpuFrameTimeMs <= 0.0) elapsedMs else (0.8 * lastGpuFrameTimeMs + 0.2 * elapsedMs)
+        }
     }
 
     private fun createProgram() {
@@ -237,9 +503,22 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
             GLES30.glDeleteProgram(programId)
             programId = 0
         }
+        releaseFbo()
+        releaseTimerQueries()
     }
 
     companion object {
+        private const val TAG = "DisCap-GL"
+
+        // EXT_disjoint_timer_query constants (not in GLES30 core)
+        private const val GL_TIME_ELAPSED_EXT = 0x88BF
+        private const val GL_QUERY_RESULT_EXT = 0x8866
+        private const val GL_QUERY_RESULT_AVAILABLE_EXT = 0x8867
+        private const val GL_GPU_DISJOINT_EXT = 0x8FBB
+
+        /** Number of frames to discard after a pipeline state change before recording measurements. */
+        private const val WARMUP_FRAME_COUNT = 20
+
         private const val VERTEX_SHADER_CODE = """#version 300 es
 layout(location = 0) in vec4 aPosition;
 layout(location = 1) in vec2 aTexCoord;

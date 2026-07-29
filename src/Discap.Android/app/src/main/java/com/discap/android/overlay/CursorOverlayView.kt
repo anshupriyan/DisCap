@@ -101,11 +101,15 @@ class CursorOverlayView(context: Context) : View(context) {
 
         val bitmap = cursorBitmap
         if (bitmap != null) {
-            val drawX = offsetX + (cursorX - hotspotX.toFloat()) * scaleX
-            val drawY = offsetY + (cursorY - hotspotY.toFloat()) * scaleY
+            val cursorScale = 1.25f
+            val finalScaleX = scaleX * cursorScale
+            val finalScaleY = scaleY * cursorScale
+
+            val drawX = offsetX + (cursorX - hotspotX.toFloat() * cursorScale) * scaleX
+            val drawY = offsetY + (cursorY - hotspotY.toFloat() * cursorScale) * scaleY
 
             matrix.reset()
-            matrix.postScale(scaleX, scaleY)
+            matrix.postScale(finalScaleX, finalScaleY)
             matrix.postTranslate(drawX, drawY)
             canvas.drawBitmap(bitmap, matrix, paint)
         } else {

@@ -198,7 +198,9 @@ class MainActivity : Activity() {
             Log.i("Discap", "Starting SocketReceiver (ADB Fallback)...")
             socketReceiver = SocketReceiver(surface, cursorManager, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
                 runOnUiThread {
-                    statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
+                    val gpuMs = openGLRenderer?.lastGpuFrameTimeMs ?: -1.0
+                    val gpuStr = if (gpuMs > 0.0) "  GPU ${"%.1f".format(gpuMs)}ms" else ""
+                    statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps$gpuStr\n" +
                             "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType}"
                 }
             }
@@ -304,6 +306,12 @@ class MainActivity : Activity() {
                         openGLRenderer?.targetViewportHeight = screenH
                     }
                 }
+                openGLRenderer?.invalidateWarmup()
+            })
+
+            addView(label("Scale Mode"))
+            addView(buttonRow(listOf("Fit" to 0, "Fill" to 1, "Stretch" to 2)) {
+                openGLRenderer?.scaleMode = OpenGLRenderer.ScaleMode.entries[it]
             })
 
             addView(label("Resolution scale"))
@@ -319,12 +327,25 @@ class MainActivity : Activity() {
             })
 
             addView(Button(this@MainActivity).apply {
-                text = "Stats off"
+                text = if (showStats) "Stats on" else "Stats off"
                 setOnClickListener {
                     showStats = !showStats
                     text = if (showStats) "Stats on" else "Stats off"
                     statsView.visibility = if (showStats) View.VISIBLE else View.GONE
+                    openGLRenderer?.gpuTimingEnabled = showStats
+                    openGLRenderer?.invalidateWarmup()
                     sendSettings()
+                }
+            })
+
+            addView(Button(this@MainActivity).apply {
+                val currentTiming = openGLRenderer?.gpuTimingEnabled ?: true
+                text = if (currentTiming) "GPU Timing on" else "GPU Timing off"
+                setOnClickListener {
+                    val renderer = openGLRenderer ?: return@setOnClickListener
+                    renderer.gpuTimingEnabled = !renderer.gpuTimingEnabled
+                    text = if (renderer.gpuTimingEnabled) "GPU Timing on" else "GPU Timing off"
+                    renderer.invalidateWarmup()
                 }
             })
         }
@@ -478,7 +499,9 @@ class MainActivity : Activity() {
                 usbReceiver?.stop()
                 usbReceiver = UsbReceiver(pfd, surface, cursorManager, { w, h -> handleVideoSizeChanged(w, h) }) { stats ->
                     runOnUiThread {
-                        statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps\n" +
+                        val gpuMs = openGLRenderer?.lastGpuFrameTimeMs ?: -1.0
+                        val gpuStr = if (gpuMs > 0.0) "  GPU ${"%.1f".format(gpuMs)}ms" else ""
+                        statsView.text = "FPS ${"%.1f".format(stats.fps)}  ${"%.1f".format(stats.bitrateMbps)} Mbps$gpuStr\n" +
                                 "Latency ${"%.1f".format(stats.latencyMs)} ms  ${stats.encoderType} (USB)"
                         statsView.visibility = if (showStats) View.VISIBLE else View.GONE
                     }
