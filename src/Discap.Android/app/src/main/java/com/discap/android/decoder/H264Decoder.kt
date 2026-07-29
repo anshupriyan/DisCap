@@ -24,6 +24,13 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
             format.setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
             format.setInteger(MediaFormat.KEY_MAX_WIDTH, 3840)
             format.setInteger(MediaFormat.KEY_MAX_HEIGHT, 2160)
+
+            // Dual-ended color lock: Force Full Range (0-255 sRGB) BT.709 color space
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
+                format.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+            }
             
             codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             
