@@ -124,7 +124,7 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     float u = saturate(-0.1146 * rAvg - 0.3854 * gAvg + 0.5000 * bAvg + 0.5);
     float v = saturate( 0.5000 * rAvg - 0.4542 * gAvg - 0.0458 * bAvg + 0.5);
 
-    OutputUV[DTid.xy] = uint2((uint)(u * 255.0 + 0.5), (uint)(v * 255.0 + 0.5));
+    OutputUV[DTid.xy] = uint2((uint)(v * 255.0 + 0.5), (uint)(u * 255.0 + 0.5));
 }
 ";
 
