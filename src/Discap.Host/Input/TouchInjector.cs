@@ -15,29 +15,24 @@ public static class TouchInjector
     private static extern bool InjectTouchInput(uint count, [In] POINTER_TOUCH_INFO[] contacts);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr LoadCursor(IntPtr hInstance, int lpCursorName);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr CopyCursor(IntPtr hCursor);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool SetSystemCursor(IntPtr hcur, uint id);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
-
-    [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
-    private const int IDC_ARROW = 32512;
-    private const uint OCR_NORMAL = 32512;
-    private const uint OCR_IBEAM = 32513;
-    private const uint OCR_WAIT = 32514;
-    private const uint OCR_CROSS = 32515;
-    private const uint OCR_HAND = 32649;
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
 
-    private const uint SPI_SETCURSORS = 0x0057;
-    private const uint SPIF_SENDWININICHANGE = 0x02;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("user32.dll")]
+    private static extern bool ClipCursor(ref RECT lpRect);
+
+    [DllImport("user32.dll", EntryPoint = "ClipCursor")]
+    private static extern bool ReleaseClipCursor(IntPtr lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetCursorPos(int X, int Y);
+
+    private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
 
     private const uint POINTER_FLAG_NONE = 0x00000000;
     private const uint POINTER_FLAG_INRANGE = 0x00000002;
@@ -68,6 +63,15 @@ public static class TouchInjector
     {
         public int X;
         public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFO
+    {
+        public uint cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -104,10 +108,8 @@ public static class TouchInjector
     }
 
     private static bool _initialized = false;
-    private static IntPtr _hOriginalCursor = IntPtr.Zero;
-    private static IntPtr _hBlankCursor = IntPtr.Zero;
-    private static bool _isCursorHidden = false;
-    private static bool _suppressHideUntilNextTouchDown = false;
+    private static bool _isCursorClipped = false;
+    private static POINT _savedMousePos;
 
     // Rule 1: ID Pool (IDs 1..10) strictly bounded by MAX_TOUCH_COUNT
     private static readonly Queue<uint> _idPool = new();
@@ -117,24 +119,43 @@ public static class TouchInjector
     private static readonly Dictionary<uint, POINT> _lastLocation = new();
     private static readonly object _lock = new();
 
-    private static bool _watcherStarted = false;
-    private static volatile int _lastWatcherX = 0;
-    private static volatile int _lastWatcherY = 0;
-    private static long _lastTouchTicks = 0;
-
     private enum PointerState { Up, Down, Move }
 
-    public static bool IsCursorHidden => _isCursorHidden;
+    public static bool IsTouchActive { get; private set; } = false;
+    public static bool IsCursorHidden => false;
 
-    public static void RestoreCursorIfHidden()
+    public static void RestoreCursorIfHidden() { }
+
+    private static void LockCursorToCurrentMonitor()
     {
-        lock (_lock)
+        if (!_isCursorClipped && GetCursorPos(out POINT cursorPos))
         {
-            if (_isCursorHidden)
+            if (!IsCursorOnStreamedDisplay(cursorPos.X, cursorPos.Y))
             {
-                RestoreCursorInternal();
-                _suppressHideUntilNextTouchDown = true;
+                _savedMousePos = cursorPos;
+                IntPtr hMonitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTONEAREST);
+                var mi = new MONITORINFO { cbSize = (uint)Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (GetMonitorInfo(hMonitor, ref mi))
+                {
+                    if (ClipCursor(ref mi.rcMonitor))
+                    {
+                        _isCursorClipped = true;
+                    }
+                }
             }
+        }
+    }
+
+    private static void ReleaseCursorLock()
+    {
+        if (_isCursorClipped)
+        {
+            ReleaseClipCursor(IntPtr.Zero);
+            if (_savedMousePos.X != 0 || _savedMousePos.Y != 0)
+            {
+                SetCursorPos(_savedMousePos.X, _savedMousePos.Y);
+            }
+            _isCursorClipped = false;
         }
     }
 
@@ -178,75 +199,7 @@ public static class TouchInjector
                 Console.Error.WriteLine($"[TOUCH-INIT] Exception during InitializeTouchInjection: {ex.Message}");
                 _initialized = false;
             }
-
-            try
-            {
-                IntPtr systemArrow = LoadCursor(IntPtr.Zero, IDC_ARROW);
-                if (systemArrow != IntPtr.Zero)
-                {
-                    _hOriginalCursor = CopyCursor(systemArrow);
-                }
-                _hBlankCursor = CreateBlankCursor();
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[TOUCH] Cursor initialization error: {ex.Message}");
-            }
-
-            StartPhysicalMouseWatcher();
         }
-    }
-
-    private static void StartPhysicalMouseWatcher()
-    {
-        if (_watcherStarted) return;
-        _watcherStarted = true;
-
-        Task.Run(async () =>
-        {
-            if (GetCursorPos(out var initPos))
-            {
-                _lastWatcherX = initPos.X;
-                _lastWatcherY = initPos.Y;
-            }
-
-            while (true)
-            {
-                await Task.Delay(15); // ~60Hz polling decoupled from DXGI capture loop
-
-                long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-                long lastTouch = Volatile.Read(ref _lastTouchTicks);
-                double msSinceTouch = (nowTicks - lastTouch) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-
-                if (GetCursorPos(out var currentPos))
-                {
-                    // 100ms Suppression Window: Ignore OS touch-to-mouse promotion position jumps during and 100ms after touch
-                    if (msSinceTouch < 100.0)
-                    {
-                        _lastWatcherX = currentPos.X;
-                        _lastWatcherY = currentPos.Y;
-                        continue;
-                    }
-
-                    // Physical mouse movement check (outside 100ms touch suppression window)
-                    if (_isCursorHidden && (currentPos.X != _lastWatcherX || currentPos.Y != _lastWatcherY))
-                    {
-                        lock (_lock)
-                        {
-                            RestoreCursorInternal();
-                            _suppressHideUntilNextTouchDown = true;
-                        }
-                        _lastWatcherX = currentPos.X;
-                        _lastWatcherY = currentPos.Y;
-                    }
-                    else if (!_isCursorHidden)
-                    {
-                        _lastWatcherX = currentPos.X;
-                        _lastWatcherY = currentPos.Y;
-                    }
-                }
-            }
-        });
     }
 
     private static int _streamBoundsX = 0;
@@ -271,9 +224,6 @@ public static class TouchInjector
         _streamBoundsY = boundsY;
         _streamWidth = width;
         _streamHeight = height;
-
-        // Stamp last touch timestamp using Volatile.Write to trigger 100ms motion watcher suppression
-        Volatile.Write(ref _lastTouchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
 
         lock (_lock)
         {
@@ -319,8 +269,6 @@ public static class TouchInjector
                 // Action: 0=Down, 1=Move, 2=Up, 3=Cancel
                 if (record.Action == 0) // DOWN
                 {
-                    _suppressHideUntilNextTouchDown = false; // New touch gesture enables hiding cursor again
-
                     if (!_idMap.TryGetValue(record.AndroidPointerId, out uint winId))
                     {
                         if (_idPool.Count == 0)
@@ -358,7 +306,7 @@ public static class TouchInjector
                 }
                 else if (record.Action == 1) // MOVE
                 {
-                    _suppressHideUntilNextTouchDown = false; // Active touch motion resets suppression flag
+                    // Rule 3: Drop Stray Events for unmapped IDs silently (No synthetic DOWN)
 
                     // Rule 3: Drop Stray Events for unmapped IDs silently (No synthetic DOWN)
                     if (!_idMap.TryGetValue(record.AndroidPointerId, out uint winId))
@@ -447,12 +395,18 @@ public static class TouchInjector
                 }
             }
 
-            // Hide/Show Cursor Management
+            // ClipCursor Lock Management
             bool anyActiveInShadow = _shadowStates.Values.Any(s => s == PointerState.Down || s == PointerState.Move);
 
-            if (anyActiveInShadow && !_isCursorHidden && !_suppressHideUntilNextTouchDown)
+            if (anyActiveInShadow && !IsTouchActive)
             {
-                HideCursorInternal();
+                LockCursorToCurrentMonitor();
+                IsTouchActive = true;
+            }
+            else if (!anyActiveInShadow && IsTouchActive)
+            {
+                ReleaseCursorLock();
+                IsTouchActive = false;
             }
         }
     }
@@ -477,6 +431,9 @@ public static class TouchInjector
     {
         lock (_lock)
         {
+            ReleaseCursorLock();
+            IsTouchActive = false;
+
             if (_shadowStates.Count == 0) return;
 
             var contacts = new List<POINTER_TOUCH_INFO>();
@@ -513,8 +470,6 @@ public static class TouchInjector
             {
                 _idPool.Enqueue(i);
             }
-
-            RestoreCursorInternal();
         }
     }
 
@@ -532,90 +487,4 @@ public static class TouchInjector
 
         InjectTouchInput(1, new[] { touchInfo });
     }
-
-    private static int _savedMouseX = -10000;
-    private static int _savedMouseY = -10000;
-
-    private static void HideCursorInternal()
-    {
-        if (!_isCursorHidden && GetCursorPos(out var pt))
-        {
-            _savedMouseX = pt.X;
-            _savedMouseY = pt.Y;
-            SetCursorPos(-10000, -10000);
-        }
-
-        if (_hBlankCursor != IntPtr.Zero)
-        {
-            bool s1 = SetSystemCursor(CopyCursor(_hBlankCursor), OCR_NORMAL);
-            bool s2 = SetSystemCursor(CopyCursor(_hBlankCursor), OCR_IBEAM);
-            bool s3 = SetSystemCursor(CopyCursor(_hBlankCursor), OCR_WAIT);
-            bool s4 = SetSystemCursor(CopyCursor(_hBlankCursor), OCR_CROSS);
-            bool s5 = SetSystemCursor(CopyCursor(_hBlankCursor), OCR_HAND);
-            _isCursorHidden = true;
-            Console.WriteLine($"[CURSOR] System cursor hidden for touch interaction (status: N={s1}, I={s2}, W={s3}, C={s4}, H={s5}).");
-        }
-        else
-        {
-            _isCursorHidden = true;
-            Console.Error.WriteLine("[CURSOR] System cursor parked off-screen for touch interaction.");
-        }
-    }
-
-    private static void RestoreCursorInternal()
-    {
-        if (_isCursorHidden)
-        {
-            if (_savedMouseX != -10000 && _savedMouseY != -10000)
-            {
-                SetCursorPos(_savedMouseX, _savedMouseY);
-                _savedMouseX = -10000;
-                _savedMouseY = -10000;
-            }
-
-            // SPI_SETCURSORS (0x0057) cleanly restores all user system cursors from registry
-            SystemParametersInfo(SPI_SETCURSORS, 0, IntPtr.Zero, SPIF_SENDWININICHANGE);
-            _isCursorHidden = false;
-            Console.WriteLine("[CURSOR] System cursor restored.");
-        }
-    }
-
-    private const int SM_CXCURSOR = 13;
-    private const int SM_CYCURSOR = 14;
-
-    private static IntPtr CreateBlankCursor()
-    {
-        int width = GetSystemMetrics(SM_CXCURSOR);
-        int height = GetSystemMetrics(SM_CYCURSOR);
-        if (width <= 0) width = 32;
-        if (height <= 0) height = 32;
-
-        int stride = ((width + 15) / 16) * 2; // DWORD/WORD aligned 1bpp stride
-        int maskSize = stride * height;
-
-        byte[] andMask = new byte[maskSize];
-        Array.Fill(andMask, (byte)0xFF); // 100% transparent
-        byte[] xorMask = new byte[maskSize]; // 0% color inversion
-
-        IntPtr hCursor = CreateCursor(IntPtr.Zero, 0, 0, width, height, andMask, xorMask);
-        if (hCursor == IntPtr.Zero)
-        {
-            int err = Marshal.GetLastWin32Error();
-            Console.Error.WriteLine($"[CURSOR-ERROR] CreateCursor ({width}x{height}, {maskSize}b) failed. Win32 Error: {err}");
-        }
-        else
-        {
-            Console.WriteLine($"[CURSOR-INIT] Created {width}x{height} transparent blank cursor handle: 0x{hCursor:X}");
-        }
-        return hCursor;
-    }
-
-    [DllImport("user32.dll")]
-    private static extern bool SetCursorPos(int X, int Y);
-
-    [DllImport("user32.dll")]
-    private static extern int GetSystemMetrics(int nIndex);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight, [In] byte[] pvANDPlane, [In] byte[] pvXORPlane);
 }

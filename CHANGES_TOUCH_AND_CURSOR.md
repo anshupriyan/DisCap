@@ -1,7 +1,7 @@
 # Commit Summary: Win32 Multi-Touch Injection & Dynamic Cursor Visibility
 
 - **Branch**: `color-fix-and-touch-update`
-- **Commit Hash**: `4ac3f16`
+- **Commit Hash**: `d05b7b9`
 - **Commit Message**: `feat(touch-cursor): fix Win32 multi-touch injection & dynamic per-display cursor visibility`
 - **Date**: July 30, 2026
 

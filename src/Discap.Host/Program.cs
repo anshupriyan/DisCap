@@ -435,6 +435,7 @@ public static class Program
                 int lastSentCursorX = -10000;
                 int lastSentCursorY = -10000;
                 bool lastSentCursorVisible = true;
+                bool isCursorHiddenByTouch = false;
                 byte[]? cachedShapeBuffer = null;
                 uint cachedShapeType = 0;
 
@@ -447,11 +448,23 @@ public static class Program
                             GetCursorPos(out var globalPoint);
                             int relX = globalPoint.X - duplicator.BoundsX;
                             int relY = globalPoint.Y - duplicator.BoundsY;
+                            bool isTouchActiveNow = TouchInjector.IsTouchActive;
+                            bool mouseMoved = (relX != lastSentCursorX || relY != lastSentCursorY);
+
+                            if (isTouchActiveNow)
+                            {
+                                isCursorHiddenByTouch = true;
+                            }
+                            else if (!isTouchActiveNow && isCursorHiddenByTouch && mouseMoved)
+                            {
+                                isCursorHiddenByTouch = false;
+                            }
+
                             bool isMouseOnStreamedDisplay = TouchInjector.IsCursorOnStreamedDisplay(globalPoint.X, globalPoint.Y);
-                            bool isCursorVisible = !TouchInjector.IsCursorHidden || !isMouseOnStreamedDisplay;
+                            bool isCursorVisible = isMouseOnStreamedDisplay && !isCursorHiddenByTouch;
 
                             // Send Position Packet (Type 3) - Only send when position moves or visibility state toggles
-                            if (relX != lastSentCursorX || relY != lastSentCursorY || isCursorVisible != lastSentCursorVisible)
+                            if (mouseMoved || isCursorVisible != lastSentCursorVisible)
                             {
                                 lastSentCursorX = relX;
                                 lastSentCursorY = relY;
