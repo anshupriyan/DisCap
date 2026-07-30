@@ -100,11 +100,11 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
         }
     }
 
-    // Extract true R, G, B components from B8G8R8A8_UNorm (.r = Blue, .g = Green, .b = Red)
-    float r00 = p00.b; float g00 = p00.g; float b00 = p00.r;
-    float r10 = p10.b; float g10 = p10.g; float b10 = p10.r;
-    float r01 = p01.b; float g01 = p01.g; float b01 = p01.r;
-    float r11 = p11.b; float g11 = p11.g; float b11 = p11.r;
+    // Extract R, G, B components from HLSL D3D11 UNorm (.r = Red, .g = Green, .b = Blue)
+    float r00 = p00.r; float g00 = p00.g; float b00 = p00.b;
+    float r10 = p10.r; float g10 = p10.g; float b10 = p10.b;
+    float r01 = p01.r; float g01 = p01.g; float b01 = p01.b;
+    float r11 = p11.r; float g11 = p11.g; float b11 = p11.b;
 
     // BT.709 Full Range (0-255 sRGB) YUV conversion
     float y00 = saturate(0.2126 * r00 + 0.7152 * g00 + 0.0722 * b00);
@@ -124,7 +124,7 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     float u = saturate(-0.1146 * rAvg - 0.3854 * gAvg + 0.5000 * bAvg + 0.5);
     float v = saturate( 0.5000 * rAvg - 0.4542 * gAvg - 0.0458 * bAvg + 0.5);
 
-    OutputUV[DTid.xy] = uint2((uint)(v * 255.0 + 0.5), (uint)(u * 255.0 + 0.5));
+    OutputUV[DTid.xy] = uint2((uint)(u * 255.0 + 0.5), (uint)(v * 255.0 + 0.5));
 }
 ";
 
