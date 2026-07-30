@@ -316,12 +316,33 @@ public static class TouchInjector
                     }
 
                     _shadowStates.TryGetValue(winId, out var currentState);
-                    if (_lastLocation.TryGetValue(winId, out var prevPt) && prevPt.X == absX && prevPt.Y == absY && currentState == PointerState.Move)
+
+                    int injectX = absX;
+                    int injectY = absY;
+
+                    if (_lastLocation.TryGetValue(winId, out var prevPt))
                     {
-                        // Skip 0-pixel delta move events to maintain clean DirectManipulation velocity math
-                        continue;
+                        if (prevPt.X == absX && prevPt.Y == absY && currentState == PointerState.Move)
+                        {
+                            // Skip 0-pixel delta move events to maintain clean DirectManipulation velocity math
+                            continue;
+                        }
+
+                        // Apply Host LERP smoothing on MOVE events to absorb socket delivery jitter
+                        if (currentState == PointerState.Move)
+                        {
+                            int dx = absX - prevPt.X;
+                            int dy = absY - prevPt.Y;
+                            int distSq = dx * dx + dy * dy;
+
+                            // LERP alpha = 0.70f for slow precision drag/scroll, 1.0f for fast flicks
+                            float alpha = distSq < 625 ? 0.70f : 1.0f;
+                            injectX = (int)(prevPt.X + dx * alpha);
+                            injectY = (int)(prevPt.Y + dy * alpha);
+                        }
                     }
-                    _lastLocation[winId] = new POINT { X = absX, Y = absY };
+
+                    _lastLocation[winId] = new POINT { X = injectX, Y = injectY };
 
                     uint tMask = pVal > 0 ? TOUCH_MASK_PRESSURE : TOUCH_MASK_NONE;
                     var touchInfo = new POINTER_TOUCH_INFO
@@ -333,7 +354,7 @@ public static class TouchInjector
                     };
                     touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
                     touchInfo.pointerInfo.pointerId = winId;
-                    touchInfo.pointerInfo.ptPixelLocation = new POINT { X = absX, Y = absY };
+                    touchInfo.pointerInfo.ptPixelLocation = new POINT { X = injectX, Y = injectY };
                     touchInfo.pointerInfo.pointerFlags = (currentState == PointerState.Up) 
                         ? (POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT)
                         : (POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);

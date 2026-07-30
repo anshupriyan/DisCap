@@ -463,14 +463,13 @@ public static class Program
                             bool isMouseOnStreamedDisplay = TouchInjector.IsCursorOnStreamedDisplay(globalPoint.X, globalPoint.Y);
                             bool isCursorVisible = isMouseOnStreamedDisplay && !isCursorHiddenByTouch;
 
-                            // Send Position Packet (Type 3) - Only send when position moves while visible, or when visibility state toggles
+                            // Send Position Packet (Type 3) - Send over network when visible or when visibility toggles,
+                            // but ALWAYS track relative position to ensure 0-jump monitor boundary crossing.
                             bool visibilityToggled = (isCursorVisible != lastSentCursorVisible);
                             bool shouldSendPos = (mouseMoved && isCursorVisible) || visibilityToggled;
 
                             if (shouldSendPos)
                             {
-                                lastSentCursorX = relX;
-                                lastSentCursorY = relY;
                                 lastSentCursorVisible = isCursorVisible;
 
                                 var posPayload = CursorPackets.SerializeCursorPos(relX, relY, isCursorVisible);
@@ -490,28 +489,30 @@ public static class Program
                                     packetWriter.WritePacket(clientStream!, posHeader, posPayload, 0, posPayload.Length);
                                 }
                             }
+                            lastSentCursorX = relX;
+                            lastSentCursorY = relY;
 
-                            // Send Shape Packet (Type 4) - Only process and transmit shape updates when cursor is visible
-                            if (isCursorVisible)
+                            // Background shape tracking: Update shape cache silently, but ONLY transmit when cursor is visible
+                            var currentShapeInfo = duplicator.PointerShapeInfo;
+                            var currentShapeBuffer = duplicator.PointerShapeBuffer;
+                            if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
                             {
-                                var currentShapeInfo = duplicator.PointerShapeInfo;
-                                var currentShapeBuffer = duplicator.PointerShapeBuffer;
-                                if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
+                                int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
+                                if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
+                                    actualSize = currentShapeBuffer.Length;
+                                var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
+
+                                bool shapeChanged = cachedShapeBuffer == null ||
+                                                     cachedShapeType != currentShapeInfo.Type ||
+                                                     !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
+
+                                if (shapeChanged)
                                 {
-                                    int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
-                                    if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
-                                        actualSize = currentShapeBuffer.Length;
-                                    var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
+                                    cachedShapeBuffer = activeBuffer.ToArray();
+                                    cachedShapeType = currentShapeInfo.Type;
 
-                                    bool shapeChanged = cachedShapeBuffer == null ||
-                                                         cachedShapeType != currentShapeInfo.Type ||
-                                                         !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
-
-                                    if (shapeChanged)
+                                    if (isCursorVisible)
                                     {
-                                        cachedShapeBuffer = activeBuffer.ToArray();
-                                        cachedShapeType = currentShapeInfo.Type;
-
                                         var shapePayload = CursorPackets.SerializeCursorShape(
                                             currentShapeInfo.Type,
                                             currentShapeInfo.Width,

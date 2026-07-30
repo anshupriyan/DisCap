@@ -6,7 +6,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.util.Log
+import android.os.SystemClock
+import android.view.Choreographer
 import android.view.View
 
 class CursorOverlayView(context: Context) : View(context) {
@@ -17,8 +18,20 @@ class CursorOverlayView(context: Context) : View(context) {
 
     private var hasReceivedFirstPacket: Boolean = false
     private var cursorBitmap: Bitmap? = null
-    private var cursorX: Float = 0f
-    private var cursorY: Float = 0f
+    
+    // Target position from network
+    private var targetX: Float = 0f
+    private var targetY: Float = 0f
+
+    // Rendered interpolated position (144Hz VSYNC)
+    private var renderX: Float = 0f
+    private var renderY: Float = 0f
+
+    // Velocity vector (px/ms) for dead-reckoning during network jitter gaps
+    private var velocityX: Float = 0f
+    private var velocityY: Float = 0f
+    private var lastPacketTimeMs: Long = 0L
+
     private var hotspotX: Int = 0
     private var hotspotY: Int = 0
     private var isCursorVisible: Boolean = true
@@ -29,20 +42,78 @@ class CursorOverlayView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val matrix = Matrix()
 
+    private var isInterpolatingLoopRunning: Boolean = false
+
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNs: Long) {
+            if (!isInterpolatingLoopRunning || !isCursorVisible) {
+                isInterpolatingLoopRunning = false
+                return
+            }
+
+            val nowMs = SystemClock.uptimeMillis()
+            val packetAgeMs = nowMs - lastPacketTimeMs
+
+            // Smooth LERP towards target position
+            val dx = targetX - renderX
+            val dy = targetY - renderY
+
+            renderX += dx * 0.45f
+            renderY += dy * 0.45f
+
+            // Dead reckoning: Extrapolate up to 35ms if network packet was delayed by socket jitter
+            if (packetAgeMs in 8L..35L) {
+                renderX += velocityX * 2.0f
+                renderY += velocityY * 2.0f
+            }
+
+            invalidate()
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    private fun startInterpolationLoop() {
+        if (!isInterpolatingLoopRunning) {
+            isInterpolatingLoopRunning = true
+            Choreographer.getInstance().postFrameCallback(frameCallback)
+        }
+    }
+
     fun updatePosition(x: Int, y: Int, visible: Boolean) {
-        this.hasReceivedFirstPacket = true
-        this.cursorX = x.toFloat()
-        this.cursorY = y.toFloat()
-        this.isCursorVisible = visible
-        this.visibility = if (visible) VISIBLE else INVISIBLE
-        postInvalidate()
+        val nowMs = SystemClock.uptimeMillis()
+        val newTargetX = x.toFloat()
+        val newTargetY = y.toFloat()
+
+        if (!hasReceivedFirstPacket) {
+            hasReceivedFirstPacket = true
+            renderX = newTargetX
+            renderY = newTargetY
+        } else if (lastPacketTimeMs > 0L) {
+            val dt = (nowMs - lastPacketTimeMs).coerceAtLeast(1L)
+            val pDx = newTargetX - targetX
+            val pDy = newTargetY - targetY
+            
+            // Smooth velocity estimation
+            velocityX = 0.5f * velocityX + 0.5f * (pDx / dt)
+            velocityY = 0.5f * velocityY + 0.5f * (pDy / dt)
+        }
+
+        lastPacketTimeMs = nowMs
+        targetX = newTargetX
+        targetY = newTargetY
+        isCursorVisible = visible
+        visibility = if (visible) VISIBLE else INVISIBLE
+
+        if (visible) {
+            startInterpolationLoop()
+        }
     }
 
     fun updateShape(bitmap: Bitmap?, hX: Int, hY: Int) {
         this.cursorBitmap = bitmap
         this.hotspotX = hX
         this.hotspotY = hY
-        postInvalidate()
+        invalidate()
     }
 
     private var defaultBitmap: Bitmap? = null
@@ -105,16 +176,16 @@ class CursorOverlayView(context: Context) : View(context) {
             val finalScaleX = scaleX * cursorScale
             val finalScaleY = scaleY * cursorScale
 
-            val drawX = offsetX + (cursorX - hotspotX.toFloat() * cursorScale) * scaleX
-            val drawY = offsetY + (cursorY - hotspotY.toFloat() * cursorScale) * scaleY
+            val drawX = offsetX + (renderX - hotspotX.toFloat() * cursorScale) * scaleX
+            val drawY = offsetY + (renderY - hotspotY.toFloat() * cursorScale) * scaleY
 
             matrix.reset()
             matrix.postScale(finalScaleX, finalScaleY)
             matrix.postTranslate(drawX, drawY)
             canvas.drawBitmap(bitmap, matrix, paint)
         } else {
-            val scaledX = offsetX + cursorX * scaleX
-            val scaledY = offsetY + cursorY * scaleY
+            val scaledX = offsetX + renderX * scaleX
+            val scaledY = offsetY + renderY * scaleY
 
             // Draw black outer border
             paint.style = Paint.Style.FILL
