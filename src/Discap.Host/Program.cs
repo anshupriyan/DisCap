@@ -434,6 +434,7 @@ public static class Program
             {
                 int lastSentCursorX = -10000;
                 int lastSentCursorY = -10000;
+                bool lastSentCursorVisible = true;
                 byte[]? cachedShapeBuffer = null;
                 uint cachedShapeType = 0;
 
@@ -446,14 +447,17 @@ public static class Program
                             GetCursorPos(out var globalPoint);
                             int relX = globalPoint.X - duplicator.BoundsX;
                             int relY = globalPoint.Y - duplicator.BoundsY;
+                            bool isMouseOnStreamedDisplay = TouchInjector.IsCursorOnStreamedDisplay(globalPoint.X, globalPoint.Y);
+                            bool isCursorVisible = !TouchInjector.IsCursorHidden || !isMouseOnStreamedDisplay;
 
-                            // Send Position Packet (Type 3)
-                            if (relX != lastSentCursorX || relY != lastSentCursorY)
+                            // Send Position Packet (Type 3) - Only send when position moves or visibility state toggles
+                            if (relX != lastSentCursorX || relY != lastSentCursorY || isCursorVisible != lastSentCursorVisible)
                             {
                                 lastSentCursorX = relX;
                                 lastSentCursorY = relY;
+                                lastSentCursorVisible = isCursorVisible;
 
-                                var posPayload = CursorPackets.SerializeCursorPos(relX, relY, true);
+                                var posPayload = CursorPackets.SerializeCursorPos(relX, relY, isCursorVisible);
                                 long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
                                 long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
 
@@ -1034,6 +1038,7 @@ public static class Program
 
                     if (MultiTouchPacket.TryReadFrom(payload, out var mtPacket))
                     {
+                        Console.WriteLine($"[TOUCH-ROUTER] Received MTCH packet with {mtPacket.PointerCount} pointers");
                         TouchInjector.ProcessMultiTouch(mtPacket, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height);
                     }
                 }

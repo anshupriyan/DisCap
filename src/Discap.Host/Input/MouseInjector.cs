@@ -63,6 +63,9 @@ public static class MouseInjector
 
     public static void ProcessInput(InputPacket packet, int boundsX, int boundsY, int width, int height)
     {
+        // Restore mouse cursor visibility if hidden by previous touch activation
+        TouchInjector.RestoreCursorIfHidden();
+
         // 1. Convert normalized coordinates (0..65535) back to float (0..1)
         float xNorm = packet.X / 65535.0f;
         float yNorm = packet.Y / 65535.0f;

@@ -505,6 +505,7 @@ class MainActivity : Activity() {
 
         if (pointers.isNotEmpty()) {
             val packetBytes = com.discap.android.protocol.TouchPacket.buildMultiTouchPacket(pointers)
+            Log.d("DisCap.Touch", "Sending MTCH packet with ${pointers.size} pointers")
             sender.sendMultiTouch(packetBytes)
         }
         return true
