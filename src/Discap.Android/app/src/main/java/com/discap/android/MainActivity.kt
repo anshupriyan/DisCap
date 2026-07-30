@@ -134,6 +134,7 @@ class MainActivity : Activity() {
                     val rect = android.graphics.Rect()
                     settingsPanel.getGlobalVisibleRect(rect)
                     if (rect.contains(event.x.toInt(), event.y.toInt())) {
+                        socketReceiver?.setTouchActive(false)
                         return@setOnTouchListener false
                     }
                 }
@@ -175,6 +176,7 @@ class MainActivity : Activity() {
         val settingsButton = Button(this).apply {
             text = "Settings"
             setOnClickListener {
+                socketReceiver?.setTouchActive(false)
                 settingsPanel.visibility = if (settingsPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             }
         }
@@ -458,36 +460,68 @@ class MainActivity : Activity() {
         )
     }
 
+    private var lastTouchSendTimeMs: Long = 0L
+
     private fun sendTouch(event: MotionEvent): Boolean {
         val sender = socketReceiver?.sender ?: return false
+
+        val actionMasked = event.actionMasked
+        val now = android.os.SystemClock.uptimeMillis()
+
+        // SMART THROTTLE: Allow ACTION_DOWN / ACTION_UP / ACTION_CANCEL instantly (0ms latency).
+        // For ACTION_MOVE, cap packet rate to ~120Hz (8ms window) to prevent Windows DirectManipulation velocity corruption.
+        if (actionMasked == MotionEvent.ACTION_MOVE) {
+            if (now - lastTouchSendTimeMs < 8L) {
+                return true
+            }
+        }
+        lastTouchSendTimeMs = now
 
         val location = IntArray(2)
         glSurfaceView.getLocationOnScreen(location)
 
-        val relX = event.rawX - location[0]
-        val relY = event.rawY - location[1]
-
+        val contentRect = openGLRenderer?.getContentRect()
         val viewW = if (glSurfaceView.width > 0) glSurfaceView.width.toFloat() else 1f
         val viewH = if (glSurfaceView.height > 0) glSurfaceView.height.toFloat() else 1f
 
-        val xNorm = (relX / viewW).coerceIn(0f, 1f)
-        val yNorm = (relY / viewH).coerceIn(0f, 1f)
+        val leftOffset = contentRect?.left ?: 0f
+        val topOffset = contentRect?.top ?: 0f
+        val contentW = if (contentRect != null && contentRect.width() > 0) contentRect.width() else viewW
+        val contentH = if (contentRect != null && contentRect.height() > 0) contentRect.height() else viewH
 
-        val action = when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 1.toByte()
-            MotionEvent.ACTION_MOVE -> 2.toByte()
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> 0.toByte()
-            else -> return false
+        val pointerCount = event.pointerCount
+        val actionIndex = event.actionIndex
+
+        val pointers = ArrayList<com.discap.android.protocol.TouchPointerData>(pointerCount)
+        for (i in 0 until pointerCount) {
+            val pointerId = event.getPointerId(i).toByte()
+            val rawX = event.getX(i)
+            val rawY = event.getY(i)
+
+            val xNorm = ((rawX - leftOffset) / contentW).coerceIn(0f, 1f)
+            val yNorm = ((rawY - topOffset) / contentH).coerceIn(0f, 1f)
+            val pressure = event.getPressure(i)
+
+            val actionByte: Byte = when (actionMasked) {
+                MotionEvent.ACTION_DOWN -> 0.toByte()
+                MotionEvent.ACTION_POINTER_DOWN -> if (i == actionIndex) 0.toByte() else 1.toByte()
+                MotionEvent.ACTION_MOVE -> 1.toByte()
+                MotionEvent.ACTION_UP -> 2.toByte()
+                MotionEvent.ACTION_POINTER_UP -> if (i == actionIndex) 2.toByte() else 1.toByte()
+                MotionEvent.ACTION_CANCEL -> 3.toByte()
+                else -> 1.toByte()
+            }
+
+            pointers.add(com.discap.android.protocol.TouchPointerData(pointerId, actionByte, xNorm, yNorm, pressure))
         }
 
-        val button = if (action == 0.toByte()) 0.toByte() else 1.toByte()
-        val pressure = (event.pressure * 255).toInt().toByte()
+        val isAnyTouchActive = actionMasked != MotionEvent.ACTION_UP && actionMasked != MotionEvent.ACTION_CANCEL
+        socketReceiver?.setTouchActive(isAnyTouchActive)
 
-        val isTouchActive = action == 1.toByte() || action == 2.toByte()
-        socketReceiver?.setTouchActive(isTouchActive)
-
-        Log.d("DisCap.Touch", "Sending touch: xNorm=$xNorm, yNorm=$yNorm, action=$action")
-        sender.sendInput(xNorm, yNorm, action, button, pressure)
+        if (pointers.isNotEmpty()) {
+            val packetBytes = com.discap.android.protocol.TouchPacket.buildMultiTouchPacket(pointers)
+            sender.sendMultiTouch(packetBytes)
+        }
         return true
     }
 

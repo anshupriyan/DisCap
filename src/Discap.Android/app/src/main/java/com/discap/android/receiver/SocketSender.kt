@@ -130,4 +130,16 @@ class SocketSender {
             }
         }.start()
     }
+
+    fun sendMultiTouch(packetBuffer: ByteArray) {
+        if (outputStream == null) return
+        Thread {
+            try {
+                writePacket(packetBuffer)
+            } catch (e: Exception) {
+                Log.e("Discap.Input", "Failed to send multi-touch: ${e.message}")
+                outputStream = null
+            }
+        }.start()
+    }
 }

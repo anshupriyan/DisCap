@@ -45,6 +45,10 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
     enum class ScaleMode { FIT, FILL, STRETCH }
     var scaleMode: ScaleMode = ScaleMode.STRETCH
 
+    fun getContentRect(): android.graphics.RectF? {
+        return null
+    }
+
     private var programId: Int = 0
     private var aPositionHandle: Int = 0
     private var aTexCoordHandle: Int = 0
