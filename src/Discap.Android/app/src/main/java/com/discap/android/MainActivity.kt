@@ -461,6 +461,8 @@ class MainActivity : Activity() {
     }
 
     private var lastTouchSendTimeMs: Long = 0L
+    private val lastNormXMap = java.util.concurrent.ConcurrentHashMap<Byte, Float>()
+    private val lastNormYMap = java.util.concurrent.ConcurrentHashMap<Byte, Float>()
 
     private fun sendTouch(event: MotionEvent): Boolean {
         val sender = socketReceiver?.sender ?: return false
@@ -498,8 +500,8 @@ class MainActivity : Activity() {
             val rawX = event.getX(i)
             val rawY = event.getY(i)
 
-            val xNorm = ((rawX - leftOffset) / contentW).coerceIn(0f, 1f)
-            val yNorm = ((rawY - topOffset) / contentH).coerceIn(0f, 1f)
+            var xNorm = ((rawX - leftOffset) / contentW).coerceIn(0f, 1f)
+            var yNorm = ((rawY - topOffset) / contentH).coerceIn(0f, 1f)
             val pressure = event.getPressure(i)
 
             val actionByte: Byte = when (actionMasked) {
@@ -510,6 +512,30 @@ class MainActivity : Activity() {
                 MotionEvent.ACTION_POINTER_UP -> if (i == actionIndex) 2.toByte() else 1.toByte()
                 MotionEvent.ACTION_CANCEL -> 3.toByte()
                 else -> 1.toByte()
+            }
+
+            if (actionByte == 0.toByte()) {
+                lastNormXMap[pointerId] = xNorm
+                lastNormYMap[pointerId] = yNorm
+            } else if (actionByte == 1.toByte()) {
+                val prevX = lastNormXMap[pointerId] ?: xNorm
+                val prevY = lastNormYMap[pointerId] ?: yNorm
+
+                val dx = xNorm - prevX
+                val dy = yNorm - prevY
+                val distSq = dx * dx + dy * dy
+
+                // Dynamic EMA smoothing: alpha = 0.45 for slow precision drag, alpha = 1.0 for fast flicks
+                val alpha = if (distSq < 0.00001f) 0.45f else if (distSq > 0.0001f) 1.0f else (0.45f + (distSq - 0.00001f) / 0.00009f * 0.55f)
+
+                xNorm = alpha * xNorm + (1f - alpha) * prevX
+                yNorm = alpha * yNorm + (1f - alpha) * prevY
+
+                lastNormXMap[pointerId] = xNorm
+                lastNormYMap[pointerId] = yNorm
+            } else {
+                lastNormXMap.remove(pointerId)
+                lastNormYMap.remove(pointerId)
             }
 
             pointers.add(com.discap.android.protocol.TouchPointerData(pointerId, actionByte, xNorm, yNorm, pressure))

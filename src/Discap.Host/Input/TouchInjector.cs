@@ -243,6 +243,13 @@ public static class TouchInjector
             {
                 if (_idMap.TryGetValue(missingId, out uint winId))
                 {
+                    _shadowStates.TryGetValue(winId, out var state);
+                    if (state == PointerState.Up)
+                    {
+                        // Pointer is already UP — ignore duplicate UP to prevent Win32 Error 87
+                        continue;
+                    }
+
                     _lastLocation.TryGetValue(winId, out var lastPt);
                     var touchInfo = new POINTER_TOUCH_INFO();
                     touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
@@ -282,17 +289,14 @@ public static class TouchInjector
                     }
 
                     _shadowStates.TryGetValue(winId, out var currentState);
-                    if (currentState == PointerState.Down || currentState == PointerState.Move)
-                    {
-                        EmitSingleStateChange(winId, absX, absY, POINTER_FLAG_UP);
-                    }
 
                     _lastLocation[winId] = new POINT { X = absX, Y = absY };
 
+                    uint tMask = pVal > 0 ? TOUCH_MASK_PRESSURE : TOUCH_MASK_NONE;
                     var touchInfo = new POINTER_TOUCH_INFO
                     {
                         touchFlags = TOUCH_FLAG_NONE,
-                        touchMask = TOUCH_MASK_NONE,
+                        touchMask = tMask,
                         orientation = 0,
                         pressure = pVal
                     };
@@ -306,9 +310,60 @@ public static class TouchInjector
                 }
                 else if (record.Action == 1) // MOVE
                 {
-                    // Rule 3: Drop Stray Events for unmapped IDs silently (No synthetic DOWN)
+                    if (!_idMap.TryGetValue(record.AndroidPointerId, out uint winId))
+                    {
+                        continue;
+                    }
 
-                    // Rule 3: Drop Stray Events for unmapped IDs silently (No synthetic DOWN)
+                    _shadowStates.TryGetValue(winId, out var currentState);
+
+                    int injectX = absX;
+                    int injectY = absY;
+
+                    if (_lastLocation.TryGetValue(winId, out var prevPt))
+                    {
+                        if (prevPt.X == absX && prevPt.Y == absY && currentState == PointerState.Move)
+                        {
+                            // Skip 0-pixel delta move events to maintain clean DirectManipulation velocity math
+                            continue;
+                        }
+
+                        // Apply Host LERP smoothing on MOVE events to absorb socket delivery jitter
+                        if (currentState == PointerState.Move)
+                        {
+                            int dx = absX - prevPt.X;
+                            int dy = absY - prevPt.Y;
+                            int distSq = dx * dx + dy * dy;
+
+                            // LERP alpha = 0.70f for slow precision drag/scroll, 1.0f for fast flicks
+                            float alpha = distSq < 625 ? 0.70f : 1.0f;
+                            injectX = (int)(prevPt.X + dx * alpha);
+                            injectY = (int)(prevPt.Y + dy * alpha);
+                        }
+                    }
+
+                    _lastLocation[winId] = new POINT { X = injectX, Y = injectY };
+
+                    uint tMask = pVal > 0 ? TOUCH_MASK_PRESSURE : TOUCH_MASK_NONE;
+                    var touchInfo = new POINTER_TOUCH_INFO
+                    {
+                        touchFlags = TOUCH_FLAG_NONE,
+                        touchMask = tMask,
+                        orientation = 0,
+                        pressure = pVal
+                    };
+                    touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
+                    touchInfo.pointerInfo.pointerId = winId;
+                    touchInfo.pointerInfo.ptPixelLocation = new POINT { X = injectX, Y = injectY };
+                    touchInfo.pointerInfo.pointerFlags = (currentState == PointerState.Up) 
+                        ? (POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT)
+                        : (POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
+
+                    _shadowStates[winId] = PointerState.Move;
+                    activeContacts.Add(touchInfo);
+                }
+                else // UP or CANCEL
+                {
                     if (!_idMap.TryGetValue(record.AndroidPointerId, out uint winId))
                     {
                         continue;
@@ -317,31 +372,7 @@ public static class TouchInjector
                     _shadowStates.TryGetValue(winId, out var currentState);
                     if (currentState == PointerState.Up)
                     {
-                        EmitSingleStateChange(winId, absX, absY, POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
-                    }
-
-                    _lastLocation[winId] = new POINT { X = absX, Y = absY };
-
-                    var touchInfo = new POINTER_TOUCH_INFO
-                    {
-                        touchFlags = TOUCH_FLAG_NONE,
-                        touchMask = TOUCH_MASK_NONE,
-                        orientation = 0,
-                        pressure = pVal
-                    };
-                    touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
-                    touchInfo.pointerInfo.pointerId = winId;
-                    touchInfo.pointerInfo.ptPixelLocation = new POINT { X = absX, Y = absY };
-                    touchInfo.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
-
-                    _shadowStates[winId] = PointerState.Move;
-                    activeContacts.Add(touchInfo);
-                }
-                else // UP or CANCEL
-                {
-                    // Rule 3: Drop Stray Events for unmapped IDs silently
-                    if (!_idMap.TryGetValue(record.AndroidPointerId, out uint winId))
-                    {
+                        // Pointer is already UP — ignore duplicate UP to prevent Win32 Error 87
                         continue;
                     }
 
@@ -376,6 +407,8 @@ public static class TouchInjector
                 {
                     int err = Marshal.GetLastWin32Error();
                     Console.Error.WriteLine($"[TOUCH-INJECT] PASS-1 (UP) failed for {upContacts.Count} contacts. Win32 Error: {err}");
+                    FlushAllTouches();
+                    return;
                 }
 
                 // Rule 2: Delayed Unmapping — recycle IDs back into pool after injection
@@ -392,6 +425,8 @@ public static class TouchInjector
                 {
                     int err = Marshal.GetLastWin32Error();
                     Console.Error.WriteLine($"[TOUCH-INJECT] PASS-2 (ACTIVE) failed for {activeContacts.Count} contacts. Win32 Error: {err}");
+                    FlushAllTouches();
+                    return;
                 }
             }
 
@@ -471,20 +506,5 @@ public static class TouchInjector
                 _idPool.Enqueue(i);
             }
         }
-    }
-
-    private static void EmitSingleStateChange(uint winId, int absX, int absY, uint pointerFlags)
-    {
-        var touchInfo = new POINTER_TOUCH_INFO
-        {
-            touchFlags = TOUCH_FLAG_NONE,
-            touchMask = TOUCH_MASK_NONE
-        };
-        touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
-        touchInfo.pointerInfo.pointerId = winId;
-        touchInfo.pointerInfo.ptPixelLocation = new POINT { X = absX, Y = absY };
-        touchInfo.pointerInfo.pointerFlags = pointerFlags;
-
-        InjectTouchInput(1, new[] { touchInfo });
     }
 }

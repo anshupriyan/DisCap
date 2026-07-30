@@ -273,9 +273,7 @@ public sealed class HardwareEncoder : IVideoEncoder
             CompletionEvent = _completionEvent
         };
 
-        Console.WriteLine($"[ENC] {DiagIteration}: calling NvEncEncodePicture (async)...");
         var encStatus = LibNvEnc.FunctionList.EncodePicture(_encoder, ref picParams);
-        Console.WriteLine($"[ENC] {DiagIteration}: NvEncEncodePicture returned {encStatus}");
 
         // In async mode, Success means the frame is queued and the event will
         // be signaled when output is ready. Mark it so TryGetNextPacket knows
@@ -315,7 +313,6 @@ public sealed class HardwareEncoder : IVideoEncoder
             else if (naluSize > 3 && _outputBuffer[0] == 0 && _outputBuffer[1] == 0 && _outputBuffer[2] == 1)
                 nalType = _outputBuffer[3] & 0x1F;
                 
-            Console.WriteLine($"[ENC] NAL type={nalType} size={naluSize} bytes");
             LastNalType = nalType;
             LastFrameSize = naluSize;
             // If queue is now empty, the pending output has been fully drained.
@@ -381,7 +378,6 @@ public sealed class HardwareEncoder : IVideoEncoder
             else if (naluSize > 3 && _outputBuffer[0] == 0 && _outputBuffer[1] == 0 && _outputBuffer[2] == 1)
                 nalType = _outputBuffer[3] & 0x1F;
                 
-            Console.WriteLine($"[ENC] NAL type={nalType} size={naluSize} bytes");
             LastNalType = nalType;
             LastFrameSize = naluSize;
             // If queue is now empty, the pending output has been fully drained.

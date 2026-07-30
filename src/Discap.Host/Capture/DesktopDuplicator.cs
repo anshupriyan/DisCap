@@ -330,8 +330,6 @@ public sealed class DesktopDuplicator : IDisposable
                 return null;
             }
 
-            Console.WriteLine($"[CAP] AcquireNextFrame returned: AccumulatedFrames={frameInfo.AccumulatedFrames}, acquireMs={acquireMs:F2}ms");
-
             UpdatePointerShape(frameInfo);
 
             if (frameInfo.LastMouseUpdateTime > 0)

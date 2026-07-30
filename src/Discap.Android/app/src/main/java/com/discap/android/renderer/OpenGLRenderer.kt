@@ -120,6 +120,17 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
     }
 
     fun initializeGL() {
+        try {
+            val eglDisplay = android.opengl.EGL14.eglGetCurrentDisplay()
+            val eglDrawSurface = android.opengl.EGL14.eglGetCurrentSurface(android.opengl.EGL14.EGL_DRAW)
+            if (eglDisplay != android.opengl.EGL14.EGL_NO_DISPLAY && eglDrawSurface != android.opengl.EGL14.EGL_NO_SURFACE) {
+                android.opengl.EGL14.eglSwapInterval(eglDisplay, 1)
+                Log.i("DisCap-GL", "[GL] Enabled eglSwapInterval(1) VSYNC lock for tear-free fast scrolling")
+            }
+        } catch (e: Exception) {
+            Log.w("DisCap-GL", "[GL] Could not set eglSwapInterval(1): ${e.message}")
+        }
+
         val textures = IntArray(1)
         GLES30.glGenTextures(1, textures, 0)
         oesTextureId = textures[0]
@@ -317,7 +328,6 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
             queryPending[0] = false
             queryPending[1] = false
             lastGpuFrameTimeMs = -1.0
-            Log.d("DisCap-GL", "[TIMER] GPU disjoint event — discarding timer results")
             return
         }
 
@@ -334,10 +344,6 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         // Convert to unsigned long (GL returns uint, Java int is signed)
         val ns = resultNs[0].toLong() and 0xFFFFFFFFL
         lastGpuFrameTimeMs = ns / 1_000_000.0
-
-        if (lastGpuFrameTimeMs > 0.01) { // Only log non-trivial measurements
-            Log.d("DisCap-GL", "[TIMER] GPU frame time: ${"%.2f".format(lastGpuFrameTimeMs)} ms")
-        }
     }
 
     private fun releaseTimerQueries() {
