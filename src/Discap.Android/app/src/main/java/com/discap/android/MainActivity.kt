@@ -506,11 +506,6 @@ class MainActivity : Activity() {
         if (pointers.isNotEmpty()) {
             val packetBytes = com.discap.android.protocol.TouchPacket.buildMultiTouchPacket(pointers)
             sender.sendMultiTouch(packetBytes)
-
-            // Legacy backward compatibility for older single-pointer hosts
-            val p0 = pointers[0]
-            val legacyAction: Byte = if (p0.action == 0.toByte()) 1.toByte() else if (p0.action == 2.toByte() || p0.action == 3.toByte()) 0.toByte() else 2.toByte()
-            sender.sendInput(p0.normX, p0.normY, legacyAction, if (legacyAction == 0.toByte()) 0.toByte() else 1.toByte(), (p0.pressure * 255).toInt().toByte())
         }
         return true
     }

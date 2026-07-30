@@ -144,6 +144,29 @@ public static class TouchInjector
         {
             var contacts = new List<POINTER_TOUCH_INFO>();
 
+            // 1. Implicit UP Sweep: Detect active pointers missing from incoming payload (dropped UP packet protection)
+            var incomingAndroidIds = new HashSet<byte>();
+            for (int i = 0; i < packet.PointerCount; i++)
+            {
+                incomingAndroidIds.Add(packet.Pointers[i].AndroidPointerId);
+            }
+
+            var missingAndroidIds = _idMap.Keys.Where(id => !incomingAndroidIds.Contains(id)).ToList();
+            foreach (var missingId in missingAndroidIds)
+            {
+                if (_idMap.TryGetValue(missingId, out uint winId))
+                {
+                    var touchInfo = new POINTER_TOUCH_INFO();
+                    touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
+                    touchInfo.pointerInfo.pointerId = winId;
+                    touchInfo.pointerInfo.pointerFlags = POINTER_FLAG_UP;
+                    contacts.Add(touchInfo);
+
+                    _shadowStates[winId] = PointerState.Up;
+                    _idMap.Remove(missingId);
+                }
+            }
+
             for (int i = 0; i < packet.PointerCount; i++)
             {
                 var record = packet.Pointers[i];
