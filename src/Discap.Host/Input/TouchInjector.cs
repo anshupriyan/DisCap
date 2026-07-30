@@ -87,6 +87,7 @@ public static class TouchInjector
         public uint touchFlags;
         public uint touchMask;
         public RECT rcContact;
+        public RECT rcContactRaw;
         public uint orientation;
         public uint pressure;
     }
@@ -112,7 +113,15 @@ public static class TouchInjector
             try
             {
                 _initialized = InitializeTouchInjection(10, TOUCH_FEEDBACK_INDIRECT);
-                Console.WriteLine($"[TOUCH] InitializeTouchInjection initialized: {_initialized}");
+                if (!_initialized)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    Console.Error.WriteLine($"[TOUCH-INIT] InitializeTouchInjection returned false. Win32 Error: {err}");
+                }
+                else
+                {
+                    Console.WriteLine($"[TOUCH] InitializeTouchInjection initialized successfully.");
+                }
             }
             catch (Exception ex)
             {
@@ -184,11 +193,13 @@ public static class TouchInjector
                 int absY = boundsY + (int)((record.NormY / 65535.0f) * height);
                 uint pVal = (uint)((record.Pressure / 65535.0f) * 1024);
 
+                var rect = new RECT { Left = absX - 2, Top = absY - 2, Right = absX + 2, Bottom = absY + 2 };
                 var touchInfo = new POINTER_TOUCH_INFO
                 {
                     touchFlags = TOUCH_FLAG_NONE,
                     touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE,
-                    rcContact = new RECT { Left = absX - 2, Top = absY - 2, Right = absX + 2, Bottom = absY + 2 },
+                    rcContact = rect,
+                    rcContactRaw = rect,
                     orientation = 0,
                     pressure = pVal
                 };
@@ -233,7 +244,11 @@ public static class TouchInjector
 
             if (contacts.Count > 0)
             {
-                InjectTouchInput((uint)contacts.Count, contacts.ToArray());
+                if (!InjectTouchInput((uint)contacts.Count, contacts.ToArray()))
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    Console.Error.WriteLine($"[TOUCH-INJECT] InjectTouchInput failed for {contacts.Count} contacts. Win32 Error: {err}");
+                }
             }
 
             // Hide/Show Cursor Management
@@ -282,18 +297,24 @@ public static class TouchInjector
 
     private static void EmitSingleStateChange(uint winId, int absX, int absY, uint pointerFlags)
     {
+        var rect = new RECT { Left = absX - 2, Top = absY - 2, Right = absX + 2, Bottom = absY + 2 };
         var touchInfo = new POINTER_TOUCH_INFO
         {
             touchFlags = TOUCH_FLAG_NONE,
             touchMask = TOUCH_MASK_CONTACTAREA,
-            rcContact = new RECT { Left = absX - 2, Top = absY - 2, Right = absX + 2, Bottom = absY + 2 }
+            rcContact = rect,
+            rcContactRaw = rect
         };
         touchInfo.pointerInfo.pointerType = (uint)PT_TOUCH;
         touchInfo.pointerInfo.pointerId = winId;
         touchInfo.pointerInfo.ptPixelLocation = new POINT { X = absX, Y = absY };
         touchInfo.pointerInfo.pointerFlags = pointerFlags;
 
-        InjectTouchInput(1, new[] { touchInfo });
+        if (!InjectTouchInput(1, new[] { touchInfo }))
+        {
+            int err = Marshal.GetLastWin32Error();
+            Console.Error.WriteLine($"[TOUCH-INJECT] EmitSingleStateChange failed. Win32 Error: {err}");
+        }
     }
 
     private static void HideCursorInternal()
