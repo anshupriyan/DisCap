@@ -125,7 +125,9 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
                 if (inputBuffer != null) {
                     inputBuffer.clear()
                     inputBuffer.put(nalData, offset, length)
-                    codec.queueInputBuffer(inputBufferIndex, 0, length, timestampUs, flags)
+                    // Use local Android System.nanoTime() to prevent SurfaceFlinger buffer queue accumulation from PC/Tablet clock drift
+                    val localPresentationUs = System.nanoTime() / 1000L
+                    codec.queueInputBuffer(inputBufferIndex, 0, length, localPresentationUs, flags)
                     true
                 } else {
                     false
@@ -179,17 +181,19 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
                 val codec = codec ?: break
 
                 // 1. Dequeue decoded output buffers from MediaCodec (non-blocking 1ms timeout)
-                val t0 = System.nanoTime()
                 val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 1000)
 
                 if (outputBufferIndex >= 0) {
-                    pendingQueue.addLast(DecodedFrame(outputBufferIndex, bufferInfo.presentationTimeUs, t0))
+                    // ZERO-LATENCY IMMEDIATE RELEASE: Render frame the exact microsecond MediaCodec finishes decoding it
+                    codec.releaseOutputBuffer(outputBufferIndex, true)
+                    framesRendered++
 
                     // Drain any additional immediately available output buffers
                     while (true) {
                         val nextIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                         if (nextIndex >= 0) {
-                            pendingQueue.addLast(DecodedFrame(nextIndex, bufferInfo.presentationTimeUs, System.nanoTime()))
+                            codec.releaseOutputBuffer(nextIndex, true)
+                            framesRendered++
                         } else {
                             break
                         }
@@ -202,65 +206,9 @@ class H264Decoder(private val surface: Surface, var width: Int, var height: Int,
                     onResolutionDetected?.invoke(fmtW, fmtH)
                 }
 
-                // Track queue depth stats
-                totalQueueDepth += pendingQueue.size
-                depthSamples++
-
-                // 2. BACKLOG SAFETY NET: Overflow prevention fallback
-                // If queue depth exceeds MAX_BUFFER_DEPTH (e.g. 4 frames during unexpected spike),
-                // drop oldest frames until queue size <= TARGET_BUFFER_DEPTH
-                while (pendingQueue.size > MAX_BUFFER_DEPTH) {
-                    val oldestFrame = pendingQueue.removeFirst()
-                    codec.releaseOutputBuffer(oldestFrame.index, false) // Drop without rendering
-                    framesDropped++
-                    Log.w("Discap.H264", "[PACING-OVERFLOW] Queue depth (${pendingQueue.size + 1}) > max ($MAX_BUFFER_DEPTH). Dropped oldest frame (ts=${oldestFrame.presentationTimeUs}us).")
-                }
-
-                // 3. STEADY-CLOCK PACED PRESENTATION RELEASE
-                val nowNs = System.nanoTime()
-
-                // Dynamic target depth: 1 during active touch scrolling for minimum latency, 2 for static viewing cushion
-                val currentTargetDepth = if (isTouchActive) 1 else TARGET_BUFFER_DEPTH
-
-                // Dynamic catch-up acceleration: if network jitter accumulated > currentTargetDepth frames,
-                // accelerate release cadence 2x to rapidly restore low latency.
-                val effectiveReleaseInterval = if (pendingQueue.size > currentTargetDepth) targetIntervalNs / 2 else targetIntervalNs
-
-                val canRelease = if (lastReleaseTimeNs == 0L) {
-                    pendingQueue.size >= currentTargetDepth
-                } else {
-                    nowNs - lastReleaseTimeNs >= effectiveReleaseInterval
-                }
-
-                if (canRelease && !pendingQueue.isEmpty()) {
-                    val frameToRelease = pendingQueue.removeFirst()
-                    // VSYNC-aligned release: System.nanoTime() + 1ms epsilon tells SurfaceFlinger to snap to the immediate next VSYNC boundary
-                    val targetVsyncNs = System.nanoTime() + 1_000_000L
-                    codec.releaseOutputBuffer(frameToRelease.index, targetVsyncNs)
-
-                    if (lastReleaseTimeNs > 0L) {
-                        val cadenceMs = (nowNs - lastReleaseTimeNs) / 1_000_000.0
-                        totalCadenceMs += cadenceMs
-                        cadenceSamples++
-                    }
-
-                    // Advance release schedule smoothly
-                    lastReleaseTimeNs = if (lastReleaseTimeNs == 0L || nowNs - lastReleaseTimeNs > targetIntervalNs * 2) {
-                        nowNs
-                    } else {
-                        lastReleaseTimeNs + effectiveReleaseInterval
-                    }
-                    framesRendered++
-                }
-
                 // 4. PERIODIC STATS LOGGING (every 1 second)
                 val nowMs = System.currentTimeMillis()
                 if (nowMs - lastLogTime >= 1000) {
-                    val avgCadenceMs = if (cadenceSamples > 0) totalCadenceMs / cadenceSamples else 0.0
-                    val avgQueueDepth = if (depthSamples > 0) totalQueueDepth.toDouble() / depthSamples else 0.0
-
-                    Log.i("Discap.H264", "[DEC-PACING-STATS] Rendered: $framesRendered | Dropped: $framesDropped | Avg Release Cadence: ${String.format("%.2f", avgCadenceMs)}ms (Target Constant: ${String.format("%.2f", targetMs)}ms) | Avg Queue Depth: ${String.format("%.2f", avgQueueDepth)} | Current Queue: ${pendingQueue.size}")
-
                     framesRendered = 0
                     framesDropped = 0
                     totalCadenceMs = 0.0

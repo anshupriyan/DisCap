@@ -19,14 +19,12 @@ class CursorManager(private val overlayView: CursorOverlayView) {
     }
 
     fun onCursorPosReceived(payload: ByteArray) {
-        Log.d("DISCAP-CURSOR", "🧬 RX HEX Type 3: ${payload.joinToString(" ") { String.format("%02X", it) }}")
         if (payload.size < 9) return
 
         val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         val x = bb.int
         val y = bb.int
         val visible = bb.get().toInt() != 0
-        Log.d("DISCAP-CURSOR", "🧠 PARSED: X=$x, Y=$y, Visible=$visible")
 
         mainHandler.post {
             overlayView.updatePosition(x, y, visible)
@@ -34,7 +32,6 @@ class CursorManager(private val overlayView: CursorOverlayView) {
     }
 
     fun onCursorShapeReceived(payload: ByteArray) {
-        Log.d("DISCAP-CURSOR", "🧬 RX HEX Type 4: ${payload.joinToString(" ") { String.format("%02X", it) }}")
         if (payload.size < 28) return
 
         val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)

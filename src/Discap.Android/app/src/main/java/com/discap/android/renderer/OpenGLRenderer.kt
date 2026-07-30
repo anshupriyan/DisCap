@@ -317,7 +317,6 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
             queryPending[0] = false
             queryPending[1] = false
             lastGpuFrameTimeMs = -1.0
-            Log.d("DisCap-GL", "[TIMER] GPU disjoint event — discarding timer results")
             return
         }
 
@@ -334,10 +333,6 @@ class OpenGLRenderer : SurfaceTexture.OnFrameAvailableListener {
         // Convert to unsigned long (GL returns uint, Java int is signed)
         val ns = resultNs[0].toLong() and 0xFFFFFFFFL
         lastGpuFrameTimeMs = ns / 1_000_000.0
-
-        if (lastGpuFrameTimeMs > 0.01) { // Only log non-trivial measurements
-            Log.d("DisCap-GL", "[TIMER] GPU frame time: ${"%.2f".format(lastGpuFrameTimeMs)} ms")
-        }
     }
 
     private fun releaseTimerQueries() {

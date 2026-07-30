@@ -463,8 +463,11 @@ public static class Program
                             bool isMouseOnStreamedDisplay = TouchInjector.IsCursorOnStreamedDisplay(globalPoint.X, globalPoint.Y);
                             bool isCursorVisible = isMouseOnStreamedDisplay && !isCursorHiddenByTouch;
 
-                            // Send Position Packet (Type 3) - Only send when position moves or visibility state toggles
-                            if (mouseMoved || isCursorVisible != lastSentCursorVisible)
+                            // Send Position Packet (Type 3) - Only send when position moves while visible, or when visibility state toggles
+                            bool visibilityToggled = (isCursorVisible != lastSentCursorVisible);
+                            bool shouldSendPos = (mouseMoved && isCursorVisible) || visibilityToggled;
+
+                            if (shouldSendPos)
                             {
                                 lastSentCursorX = relX;
                                 lastSentCursorY = relY;
@@ -488,49 +491,52 @@ public static class Program
                                 }
                             }
 
-                            // Send Shape Packet (Type 4)
-                            var currentShapeInfo = duplicator.PointerShapeInfo;
-                            var currentShapeBuffer = duplicator.PointerShapeBuffer;
-                            if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
+                            // Send Shape Packet (Type 4) - Only process and transmit shape updates when cursor is visible
+                            if (isCursorVisible)
                             {
-                                int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
-                                if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
-                                    actualSize = currentShapeBuffer.Length;
-                                var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
-
-                                bool shapeChanged = cachedShapeBuffer == null ||
-                                                     cachedShapeType != currentShapeInfo.Type ||
-                                                     !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
-
-                                if (shapeChanged)
+                                var currentShapeInfo = duplicator.PointerShapeInfo;
+                                var currentShapeBuffer = duplicator.PointerShapeBuffer;
+                                if (currentShapeInfo.Width > 0 && currentShapeInfo.Height > 0 && currentShapeBuffer.Length > 0)
                                 {
-                                    cachedShapeBuffer = activeBuffer.ToArray();
-                                    cachedShapeType = currentShapeInfo.Type;
+                                    int actualSize = (int)(currentShapeInfo.Height * currentShapeInfo.Pitch);
+                                    if (actualSize <= 0 || actualSize > currentShapeBuffer.Length)
+                                        actualSize = currentShapeBuffer.Length;
+                                    var activeBuffer = currentShapeBuffer.AsSpan(0, actualSize);
 
-                                    var shapePayload = CursorPackets.SerializeCursorShape(
-                                        currentShapeInfo.Type,
-                                        currentShapeInfo.Width,
-                                        currentShapeInfo.Height,
-                                        currentShapeInfo.Pitch,
-                                        currentShapeInfo.HotSpot.X,
-                                        currentShapeInfo.HotSpot.Y,
-                                        activeBuffer);
+                                    bool shapeChanged = cachedShapeBuffer == null ||
+                                                         cachedShapeType != currentShapeInfo.Type ||
+                                                         !cachedShapeBuffer.AsSpan().SequenceEqual(activeBuffer);
 
-                                    long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
-                                    long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
-
-                                    lock (streamLock)
+                                    if (shapeChanged)
                                     {
-                                        uint seq = sequenceNumber++;
-                                        var shapeHeader = PacketHeader.Create(
-                                            FrameType.CursorShape,
-                                            (ushort)currentShapeInfo.Width,
-                                            (ushort)currentShapeInfo.Height,
-                                            (uint)shapePayload.Length, (uint)shapePayload.Length,
-                                            elapsedUs,
-                                            seq,
-                                            0);
-                                        packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
+                                        cachedShapeBuffer = activeBuffer.ToArray();
+                                        cachedShapeType = currentShapeInfo.Type;
+
+                                        var shapePayload = CursorPackets.SerializeCursorShape(
+                                            currentShapeInfo.Type,
+                                            currentShapeInfo.Width,
+                                            currentShapeInfo.Height,
+                                            currentShapeInfo.Pitch,
+                                            currentShapeInfo.HotSpot.X,
+                                            currentShapeInfo.HotSpot.Y,
+                                            activeBuffer);
+
+                                        long elapsedTicks = Stopwatch.GetTimestamp() - streamStartTime;
+                                        long elapsedUs = elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+
+                                        lock (streamLock)
+                                        {
+                                            uint seq = sequenceNumber++;
+                                            var shapeHeader = PacketHeader.Create(
+                                                FrameType.CursorShape,
+                                                (ushort)currentShapeInfo.Width,
+                                                (ushort)currentShapeInfo.Height,
+                                                (uint)shapePayload.Length, (uint)shapePayload.Length,
+                                                elapsedUs,
+                                                seq,
+                                                0);
+                                            packetWriter.WritePacket(clientStream!, shapeHeader, shapePayload, 0, shapePayload.Length);
+                                        }
                                     }
                                 }
                             }
@@ -603,7 +609,6 @@ public static class Program
 
                                     long tSendEnd = Stopwatch.GetTimestamp();
                                     double sendMs = (tSendEnd - sendStartTicks) * 1000.0 / Stopwatch.Frequency;
-                                    Console.WriteLine($"[TIMING] Send: {sendMs:F2}ms ({frame.Length} NALs, {totalPayloadLength} bytes)");
                                     totalSendTicks += (tSendEnd - sendStartTicks);
                                     nvencFrames++;
                                 }
@@ -638,7 +643,7 @@ public static class Program
             {
                 try
                 {
-                    Console.WriteLine($"[LOOP] Iteration {++loopIteration} starting");
+                    ++loopIteration;
                     if (encoder is HardwareEncoder hwIter) hwIter.DiagIteration = loopIteration;
 
                     if (loopIteration % 10 == 0)
@@ -668,7 +673,7 @@ public static class Program
                     if (effectivePacingFps > 0)
                     {
                         long minFrameTicks = Stopwatch.Frequency / effectivePacingFps;
-                        if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + minFrameTicks)
+                        if (nextFrameDueTicks == 0 || currentCaptureTicks > nextFrameDueTicks + (minFrameTicks / 2))
                             nextFrameDueTicks = currentCaptureTicks + minFrameTicks;
                         else
                             nextFrameDueTicks += minFrameTicks;
@@ -678,9 +683,7 @@ public static class Program
                 // Capture next frame.
                 // On timeout (static screen) DXGI returns null — reuse last frame so the
                 // encoder pipeline keeps ticking rather than stalling indefinitely.
-                Console.WriteLine($"[LOOP] {loopIteration}: waiting for AcquireNextFrame...");
                 var newFrame = duplicator.AcquireNextFrame();
-                Console.WriteLine($"[LOOP] {loopIteration}: AcquireNextFrame returned {(newFrame == null ? "null (timeout)" : "frame")}");
 
                 FrameBuffer? frame;
                 bool isRepeatFrame;
@@ -696,7 +699,6 @@ public static class Program
 
                     if (lastAcquireSuccessTicks != 0 && timeSinceLastAcquiredFrameMs >= IDLE_GAP_THRESHOLD_MS)
                     {
-                        Console.WriteLine($"[IDLE-RESUME] Discarding first post-idle frame (gap={timeSinceLastAcquiredFrameMs:F1}ms) to ensure clean capture.");
                         lastAcquireSuccessTicks = nowTicks;
                         newFrame.Dispose();
                         continue;
@@ -708,7 +710,6 @@ public static class Program
                     isRepeatFrame = false;
                     lastAcquireSuccessTicks = nowTicks;
 
-                    Console.WriteLine($"[LOOP] {loopIteration}: new frame captured (AccumulatedFrames={frame.AccumulatedFrames}), dirtyArea={frame.TotalDirtyArea}, timeSinceLastFrame={timeSinceLastAcquiredFrameMs:F1}ms");
                     if (wasIdle)
                     {
                         wasIdle = false;
@@ -730,7 +731,6 @@ public static class Program
                         frame = lastFrame;
                         isRepeatFrame = true;
                         lastRepeatFrameTicks = nowTicks;
-                        Console.WriteLine($"[KEEP-ALIVE-REPEAT] Sending 10 FPS repeat frame to preserve connection without network bloat.");
                     }
                     else
                     {
@@ -766,7 +766,6 @@ public static class Program
                 // If encoder is unavailable (e.g. still initializing), skip frame
                 if (nvencAvailable && !encoder.IsAvailable)
                 {
-                    Console.WriteLine($"[LOOP] {loopIteration}: Encoder not available, skipping frame");
                     continue;
                 }
 
@@ -775,7 +774,6 @@ public static class Program
                 // For LZ4-only mode, skip unchanged frames to save bandwidth.
                 if (!isRepeatFrame && frame.TotalDirtyArea == 0 && (config.ForceLz4Only || !nvencAvailable))
                 {
-                    Console.WriteLine($"[LOOP] {loopIteration}: zero dirty area (LZ4 mode) — skipping");
                     continue;
                 }
                 
@@ -839,9 +837,7 @@ public static class Program
                             lastSetQuality = targetQuality;
                             lastReconfigureTicks = currentTicks;
                         }
-                    Console.WriteLine($"[ENC] {loopIteration}: calling SubmitFrame (NvEncEncodePicture)...");
                     encoder.SubmitFrame(frame);
-                    Console.WriteLine($"[ENC] {loopIteration}: SubmitFrame returned");
 
                     bool sentAny = false;
                     var nalBundle = new System.Collections.Generic.List<(PacketHeader Header, byte[] Payload)>();
