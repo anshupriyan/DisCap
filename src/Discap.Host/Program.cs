@@ -319,6 +319,7 @@ public static class Program
             }
             
             Console.WriteLine("═══ Step 5: Streaming ═══");
+            TouchInjector.Initialize();
             server.Start();
         }
 
@@ -996,25 +997,64 @@ public static class Program
 
     private static void HandleInput(Stream stream, DesktopDuplicator duplicator, StreamSettings settings, IVideoEncoder? encoder)
     {
-        byte[] buffer = new byte[InputPacket.SIZE];
+        byte[] headerBuffer = new byte[4];
         try
         {
             while (true)
             {
-                stream.ReadExactly(buffer, 0, InputPacket.SIZE);
-                uint magic = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+                stream.ReadExactly(headerBuffer, 0, 4);
+                uint magic = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(headerBuffer);
 
-                if (InputPacket.TryReadFrom(buffer, out var packet))
+                if (magic == InputPacket.MAGIC) // "INPT"
                 {
-                    MouseInjector.ProcessInput(packet, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height);
+                    byte[] rest = new byte[8];
+                    stream.ReadExactly(rest, 0, 8);
+                    byte[] full = new byte[12];
+                    Array.Copy(headerBuffer, 0, full, 0, 4);
+                    Array.Copy(rest, 0, full, 4, 8);
+
+                    if (InputPacket.TryReadFrom(full, out var packet))
+                    {
+                        MouseInjector.ProcessInput(packet, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height);
+                    }
                 }
-                else if (ControlPacket.TryReadFrom(buffer, out var control))
+                else if (magic == MultiTouchPacket.MAGIC_MTCH) // "MTCH"
                 {
-                    settings.Update(control);
-                    Console.WriteLine($"\n[CFG] Client settings: {settings.BitrateMbps}Mbps, {settings.FpsCap}fps, {settings.ResolutionScale}%, mode={settings.EncoderMode}, stats={settings.ShowStats}, quality={settings.TargetQuality}");
+                    int countByte = stream.ReadByte();
+                    if (countByte < 0) break;
+                    byte count = (byte)countByte;
+                    int payloadSize = count * 10;
+                    byte[] payload = new byte[5 + payloadSize];
+                    Array.Copy(headerBuffer, 0, payload, 0, 4);
+                    payload[4] = count;
+                    if (payloadSize > 0)
+                    {
+                        stream.ReadExactly(payload, 5, payloadSize);
+                    }
+
+                    if (MultiTouchPacket.TryReadFrom(payload, out var mtPacket))
+                    {
+                        TouchInjector.ProcessMultiTouch(mtPacket, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height);
+                    }
                 }
-                else if (magic == 0x52494C50) // "PLIR" (0x52494C50 in little endian) — Picture Loss Indication (Request IDR)
+                else if (magic == ControlPacket.MAGIC) // "CTRL"
                 {
+                    byte[] rest = new byte[8];
+                    stream.ReadExactly(rest, 0, 8);
+                    byte[] full = new byte[12];
+                    Array.Copy(headerBuffer, 0, full, 0, 4);
+                    Array.Copy(rest, 0, full, 4, 8);
+
+                    if (ControlPacket.TryReadFrom(full, out var control))
+                    {
+                        settings.Update(control);
+                        Console.WriteLine($"\n[CFG] Client settings: {settings.BitrateMbps}Mbps, {settings.FpsCap}fps, {settings.ResolutionScale}%, mode={settings.EncoderMode}, stats={settings.ShowStats}, quality={settings.TargetQuality}");
+                    }
+                }
+                else if (magic == 0x52494C50) // "PLIR"
+                {
+                    byte[] rest = new byte[8];
+                    stream.ReadExactly(rest, 0, 8);
                     Console.WriteLine("\n[PLI] Received IDR request from Android client — forcing keyframe.");
                     encoder?.ForceKeyFrame();
                 }
@@ -1023,6 +1063,10 @@ public static class Program
         catch
         {
             // Client disconnected or stream closed
+        }
+        finally
+        {
+            TouchInjector.FlushAllTouches();
         }
     }
 

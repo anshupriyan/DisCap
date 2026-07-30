@@ -464,30 +464,54 @@ class MainActivity : Activity() {
         val location = IntArray(2)
         glSurfaceView.getLocationOnScreen(location)
 
-        val relX = event.rawX - location[0]
-        val relY = event.rawY - location[1]
-
+        val contentRect = openGLRenderer?.getContentRect()
         val viewW = if (glSurfaceView.width > 0) glSurfaceView.width.toFloat() else 1f
         val viewH = if (glSurfaceView.height > 0) glSurfaceView.height.toFloat() else 1f
 
-        val xNorm = (relX / viewW).coerceIn(0f, 1f)
-        val yNorm = (relY / viewH).coerceIn(0f, 1f)
+        val leftOffset = contentRect?.left ?: 0f
+        val topOffset = contentRect?.top ?: 0f
+        val contentW = if (contentRect != null && contentRect.width() > 0) contentRect.width() else viewW
+        val contentH = if (contentRect != null && contentRect.height() > 0) contentRect.height() else viewH
 
-        val action = when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 1.toByte()
-            MotionEvent.ACTION_MOVE -> 2.toByte()
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> 0.toByte()
-            else -> return false
+        val pointerCount = event.pointerCount
+        val pointers = mutableListOf<com.discap.android.protocol.TouchPointerData>()
+        val actionMasked = event.actionMasked
+        val actionIndex = event.actionIndex
+
+        for (i in 0 until pointerCount) {
+            val pointerId = event.getPointerId(i).toByte()
+            val rawX = event.getX(i)
+            val rawY = event.getY(i)
+
+            val xNorm = ((rawX - leftOffset) / contentW).coerceIn(0f, 1f)
+            val yNorm = ((rawY - topOffset) / contentH).coerceIn(0f, 1f)
+            val pressure = event.getPressure(i)
+
+            val actionByte: Byte = when (actionMasked) {
+                MotionEvent.ACTION_DOWN -> 0.toByte()
+                MotionEvent.ACTION_POINTER_DOWN -> if (i == actionIndex) 0.toByte() else 1.toByte()
+                MotionEvent.ACTION_MOVE -> 1.toByte()
+                MotionEvent.ACTION_UP -> 2.toByte()
+                MotionEvent.ACTION_POINTER_UP -> if (i == actionIndex) 2.toByte() else 1.toByte()
+                MotionEvent.ACTION_CANCEL -> 3.toByte()
+                else -> 1.toByte()
+            }
+
+            pointers.add(com.discap.android.protocol.TouchPointerData(pointerId, actionByte, xNorm, yNorm, pressure))
         }
 
-        val button = if (action == 0.toByte()) 0.toByte() else 1.toByte()
-        val pressure = (event.pressure * 255).toInt().toByte()
+        val isAnyTouchActive = actionMasked != MotionEvent.ACTION_UP && actionMasked != MotionEvent.ACTION_CANCEL
+        socketReceiver?.setTouchActive(isAnyTouchActive)
 
-        val isTouchActive = action == 1.toByte() || action == 2.toByte()
-        socketReceiver?.setTouchActive(isTouchActive)
+        if (pointers.isNotEmpty()) {
+            val packetBytes = com.discap.android.protocol.TouchPacket.buildMultiTouchPacket(pointers)
+            sender.sendMultiTouch(packetBytes)
 
-        Log.d("DisCap.Touch", "Sending touch: xNorm=$xNorm, yNorm=$yNorm, action=$action")
-        sender.sendInput(xNorm, yNorm, action, button, pressure)
+            // Legacy backward compatibility for older single-pointer hosts
+            val p0 = pointers[0]
+            val legacyAction: Byte = if (p0.action == 0.toByte()) 1.toByte() else if (p0.action == 2.toByte() || p0.action == 3.toByte()) 0.toByte() else 2.toByte()
+            sender.sendInput(p0.normX, p0.normY, legacyAction, if (legacyAction == 0.toByte()) 0.toByte() else 1.toByte(), (p0.pressure * 255).toInt().toByte())
+        }
         return true
     }
 
