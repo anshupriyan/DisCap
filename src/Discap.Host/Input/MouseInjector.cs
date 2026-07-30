@@ -63,10 +63,10 @@ public static class MouseInjector
 
     public static void ProcessInput(InputPacket packet, int boundsX, int boundsY, int width, int height)
     {
-        // Hard Shield: Ignore remote trackpad/mouse packets while multi-touch is active
+        // If multi-touch is active when a remote mouse packet arrives, flush touches to transition to mouse input
         if (TouchInjector.IsTouchActive)
         {
-            return;
+            TouchInjector.FlushAllTouches();
         }
 
         // Restore mouse cursor visibility if hidden by previous touch activation

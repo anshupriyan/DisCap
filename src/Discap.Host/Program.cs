@@ -1051,7 +1051,6 @@ public static class Program
 
                     if (MultiTouchPacket.TryReadFrom(payload, out var mtPacket))
                     {
-                        Console.WriteLine($"[TOUCH-ROUTER] Received MTCH packet with {mtPacket.PointerCount} pointers");
                         TouchInjector.ProcessMultiTouch(mtPacket, duplicator.BoundsX, duplicator.BoundsY, duplicator.Width, duplicator.Height);
                     }
                 }

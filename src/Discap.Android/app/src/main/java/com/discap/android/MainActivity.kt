@@ -134,6 +134,7 @@ class MainActivity : Activity() {
                     val rect = android.graphics.Rect()
                     settingsPanel.getGlobalVisibleRect(rect)
                     if (rect.contains(event.x.toInt(), event.y.toInt())) {
+                        socketReceiver?.setTouchActive(false)
                         return@setOnTouchListener false
                     }
                 }
@@ -175,6 +176,7 @@ class MainActivity : Activity() {
         val settingsButton = Button(this).apply {
             text = "Settings"
             setOnClickListener {
+                socketReceiver?.setTouchActive(false)
                 settingsPanel.visibility = if (settingsPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             }
         }
@@ -458,8 +460,22 @@ class MainActivity : Activity() {
         )
     }
 
+    private var lastTouchSendTimeMs: Long = 0L
+
     private fun sendTouch(event: MotionEvent): Boolean {
         val sender = socketReceiver?.sender ?: return false
+
+        val actionMasked = event.actionMasked
+        val now = android.os.SystemClock.uptimeMillis()
+
+        // SMART THROTTLE: Allow ACTION_DOWN / ACTION_UP / ACTION_CANCEL instantly (0ms latency).
+        // For ACTION_MOVE, cap packet rate to ~120Hz (8ms window) to prevent Windows DirectManipulation velocity corruption.
+        if (actionMasked == MotionEvent.ACTION_MOVE) {
+            if (now - lastTouchSendTimeMs < 8L) {
+                return true
+            }
+        }
+        lastTouchSendTimeMs = now
 
         val location = IntArray(2)
         glSurfaceView.getLocationOnScreen(location)
@@ -474,10 +490,9 @@ class MainActivity : Activity() {
         val contentH = if (contentRect != null && contentRect.height() > 0) contentRect.height() else viewH
 
         val pointerCount = event.pointerCount
-        val pointers = mutableListOf<com.discap.android.protocol.TouchPointerData>()
-        val actionMasked = event.actionMasked
         val actionIndex = event.actionIndex
 
+        val pointers = ArrayList<com.discap.android.protocol.TouchPointerData>(pointerCount)
         for (i in 0 until pointerCount) {
             val pointerId = event.getPointerId(i).toByte()
             val rawX = event.getX(i)
@@ -505,7 +520,6 @@ class MainActivity : Activity() {
 
         if (pointers.isNotEmpty()) {
             val packetBytes = com.discap.android.protocol.TouchPacket.buildMultiTouchPacket(pointers)
-            Log.d("DisCap.Touch", "Sending MTCH packet with ${pointers.size} pointers")
             sender.sendMultiTouch(packetBytes)
         }
         return true
